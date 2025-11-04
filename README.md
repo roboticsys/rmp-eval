@@ -180,11 +180,15 @@ RMP is designed to run all its threads on a single isolated CPU. This is the nor
 
 ### Should RMP be running during this test?
 
-**No.** Do not run rmp-eval while RMP/RMPNetwork is running. This tool is meant to evaluate your hardware **before** deploying RMP, not to test alongside it. Running both simultaneously would interfere with the timing measurements.
+No. Do not run rmp-eval while RMP/RMPNetwork is running. This tool is meant to evaluate your hardware **before** deploying RMP, not to test alongside it. Running both simultaneously would interfere with the timing measurements.
 
 ### How long should I run the test?
 
-We recommend running for at least **5-10 minutes** to capture various system states and potential latency spikes. Longer tests (30-60 minutes) can reveal issues that only occur under sustained load or periodic system activities. Press `Ctrl+C` to stop and view results.
+We recommend initially running for at least **5-10 minutes** to capture various system states and potential latency spikes. Longer tests (24+ hours) can reveal issues that only occur under sustained load or periodic system activities. Press `Ctrl+C` to stop and view results.
+
+### Should I test under load?
+
+Yes. To get a realistic assessment, run the test while your system is under typical load conditions expected during RMP operation.
 
 ### What do the latency categories/buckets mean?
 
@@ -198,25 +202,9 @@ Based on the RMP [PC hardware latency requirements.](https://support.roboticsys.
 
 For 1kHz (1000µs period), aim for all samples in "Great" category with max latency < 125µs. The buckets will scale proportionally for different target periods. 
 
-### The CPU frequency check shows a warning - is this a problem?
-
-The reported CPU frequency for isolated cores is **not always reliable** due to the difficulty of reading frequency values from fully isolated CPUs. Focus instead on ensuring:
-
-1. The CPU governor is set to "performance" (the tool checks this)
-2. Turbo/boost is disabled (the tool checks this)
-3. Your actual timing results are in the "Great" category
-
-Tools like `turbostat` (x64) can provide more accurate frequency readings if needed, but the timing measurements themselves are the definitive indicator of system performance.
-
 ### Some config checks failed - can I still use my system?
 
-It depends on which checks failed and the measured performance:
-
-- **Critical**: PREEMPT_RT, RT core isolation - these must pass
-- **Important**: CPU governor=performance, turbo disabled, deep C-states, IRQ affinity - fix these if possible
-- **Informational**: CPU frequency reading - not critical if timing results are good
-
-The timing results table is the ultimate test. If your latencies are consistently in "Great" range despite some config warnings, your system may still be suitable.
+The timing results table is the ultimate test. If your latencies are consistently in "Great" range (under load) despite some config warnings, your system is still suitable.
 
 ### Do I need a PREEMPT_RT kernel to run this tool?
 
