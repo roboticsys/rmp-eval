@@ -130,8 +130,7 @@ Options:
 --verbose, -v            Enable verbose output
 --no-config, -nc         Skip system configuration checks
 --only-config, -oc       Run system configuration checks only, then exit
---bucket-width, -b       Bucket width in microseconds for counting occurrences (default:
-                         auto).
+--bucket-width, -b       Bucket width in microseconds for counting occurrences (default: auto).
 --help, -h               Show this help message
 --version                Show version information
 ```
@@ -158,6 +157,85 @@ cmake --build build
 # Run
 sudo ./build/rmp-eval
 ```
+
+## FAQ
+
+### What are the Sender and Receiver threads?
+
+The **Sender** thread simulates the cyclic thread that sends EtherCAT frames at a fixed rate (default 1000µs/1kHz). The **Receiver** thread waits for and processes EtherCAT responses. These two threads are sufficient to identify worst-case latency in your system.
+
+When no NIC is specified, only the Sender thread runs (labeled "Cyclic") to test basic cyclic timing performance.
+
+### How does this relate to RMP's 8 threads?
+
+While RMP/RMPNetwork uses 8 threads in total for its full operation, this evaluation tool focuses on testing the **worst-case latency** of the critical cyclic timing path. The 2-thread test (sender/receiver) is designed to stress-test the timing characteristics that matter most for real-time performance.
+
+### Should both threads run on the same isolated CPU?
+
+**Yes.** Both the sender and receiver threads should run on the same isolated CPU (default behavior). This matches how RMP operates - all 8 of RMP's threads normally run on a single isolated CPU. You can verify/change this with `--send-cpu` and `--receive-cpu` options if needed, but keeping them on the same core is the recommended configuration.
+
+### Can RMP use multiple isolated CPUs?
+
+RMP is designed to run all its threads on a single isolated CPU. This is the normal and expected configuration for optimal real-time performance.
+
+### Should RMP be running during this test?
+
+**No.** Do not run rmp-eval while RMP/RMPNetwork is running. This tool is meant to evaluate your hardware **before** deploying RMP, not to test alongside it. Running both simultaneously would interfere with the timing measurements.
+
+### How long should I run the test?
+
+We recommend running for at least **5-10 minutes** to capture various system states and potential latency spikes. Longer tests (30-60 minutes) can reveal issues that only occur under sustained load or periodic system activities. Press `Ctrl+C` to stop and view results.
+
+### What do the latency categories/buckets mean?
+
+Based on the RMP [PC hardware latency requirements.](https://support.roboticsys.com/rmp/guide-pc-latency-jitter-bios.html)
+
+- **Great** (< 125µs): Excellent for 1kHz operation, meets RMP requirements
+- **Good** (< 250µs): Acceptable but approaching limits
+- **Poor** (< 500µs): Marginal, may cause issues under load
+- **Bad** (< 1000µs): Inadequate for reliable operation
+- **Pathetic** (≥ 1000µs): Unacceptable, missed deadline
+
+For 1kHz (1000µs period), aim for all samples in "Great" category with max latency < 125µs.  The buckets will scale proportionally for different target periods. 
+
+### The CPU frequency check shows a warning - is this a problem?
+
+The reported CPU frequency for isolated cores is **not always reliable** due to the difficulty of reading frequency values from fully isolated CPUs. Focus instead on ensuring:
+
+1. The CPU governor is set to "performance" (the tool checks this)
+2. Turbo/boost is disabled (the tool checks this)
+3. Your actual timing results are in the "Great" category
+
+Tools like `turbostat` (x64) can provide more accurate frequency readings if needed, but the timing measurements themselves are the definitive indicator of system performance.
+
+### Some config checks failed - can I still use my system?
+
+It depends on which checks failed and the measured performance:
+
+- **Critical**: PREEMPT_RT, RT core isolation - these must pass
+- **Important**: CPU governor=performance, turbo disabled, deep C-states, IRQ affinity - fix these if possible
+- **Informational**: CPU frequency reading - not critical if timing results are good
+
+The timing results table is the ultimate test. If your latencies are consistently in "Great" range despite some config warnings, your system may still be suitable.
+
+### Do I need a PREEMPT_RT kernel to run this tool?
+
+The tool will run on non-RT kernels, but **PREEMPT_RT is required for RMP** itself. This evaluation tool checks for PREEMPT_RT and will report if it's missing. If you're evaluating hardware for RMP deployment, install a PREEMPT_RT kernel first to get accurate results.
+
+### Why do I need an EtherCAT drive connected for NIC testing?
+
+The receiver thread waits for actual EtherCAT responses to measure round-trip timing. Without a connected drive, the receiver will timeout and the test will fail. If you only want to test cyclic timing without NIC hardware, omit the `--nic` parameter to run in cyclic-only mode.
+
+### Can I use this tool for non-RMP real-time applications?
+
+Yes! While designed for RMP evaluation, this tool is useful for testing any Linux real-time system that requires:
+
+- Sub-millisecond cyclic timing
+- Low-latency EtherCAT communication
+- Isolated CPU performance validation
+- PREEMPT_RT kernel verification
+
+Adjust `--send-sleep` to match your application's cycle time.
 
 ## License
 
