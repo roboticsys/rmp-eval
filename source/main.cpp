@@ -424,6 +424,12 @@ int main(int argc, char* argv[])
       return 1;
     }
 
+    if (geteuid() != 0)
+    {
+      std::cerr << "Error: Not running as root. This may cause failures when accessing system configuration or opening raw sockets.\n";
+      return 1;
+    }
+
     if (!noConfig)
     {
       Evaluator::ReportSystemConfiguration(params.SendCpu, params.NicName);
@@ -433,12 +439,6 @@ int main(int argc, char* argv[])
     if (onlyConfig)
     {
       return 0;
-    }
-
-    if (geteuid() != 0)
-    {
-      std::cerr << "Error: Not running as root. This may cause failures when opening raw sockets or setting thread priorities.\n";
-      return 1;
     }
 
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
