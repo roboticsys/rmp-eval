@@ -1084,13 +1084,101 @@ namespace Evaluator
   {
     std::ostringstream output;
     output << "Kernel: ";
-    
+
     struct utsname buffer;
     if (uname(&buffer) == 0)
     {
       output << buffer.sysname << " " << buffer.release << " " << buffer.version << " " << buffer.machine;
     }
-    
+
+    return output.str();
+  }
+
+  std::string GetHostname()
+  {
+    std::ostringstream output;
+    output << "Hostname: ";
+
+    struct utsname buffer;
+    if (uname(&buffer) == 0)
+    {
+      output << buffer.nodename;
+    }
+    else
+    {
+      output << "unknown";
+    }
+
+    return output.str();
+  }
+
+  std::string GetOSInfo()
+  {
+    std::ostringstream output;
+    output << "OS: ";
+
+    auto content = Slurp("/etc/os-release");
+    if (!content)
+    {
+      output << "unknown";
+      return output.str();
+    }
+
+    std::string name, version;
+    std::istringstream stream(*content);
+    std::string line;
+
+    while (std::getline(stream, line))
+    {
+      if (line.rfind("PRETTY_NAME=", 0) == 0)
+      {
+        // Extract value, removing quotes
+        std::string value = line.substr(12);
+        if (!value.empty() && value.front() == '"' && value.back() == '"')
+        {
+          value = value.substr(1, value.size() - 2);
+        }
+        output << value;
+        return output.str();
+      }
+    }
+
+    // Fallback: try NAME and VERSION separately
+    stream.clear();
+    stream.seekg(0);
+    while (std::getline(stream, line))
+    {
+      if (line.rfind("NAME=", 0) == 0)
+      {
+        name = line.substr(5);
+        if (!name.empty() && name.front() == '"' && name.back() == '"')
+        {
+          name = name.substr(1, name.size() - 2);
+        }
+      }
+      else if (line.rfind("VERSION=", 0) == 0)
+      {
+        version = line.substr(8);
+        if (!version.empty() && version.front() == '"' && version.back() == '"')
+        {
+          version = version.substr(1, version.size() - 2);
+        }
+      }
+    }
+
+    if (!name.empty())
+    {
+      output << name;
+      if (!version.empty())
+      {
+        output << " " << version;
+      }
+    }
+    else
+    {
+      output << "unknown";
+    }
+
     return output.str();
   }
 
@@ -1103,6 +1191,7 @@ namespace Evaluator
       return;
     }
 
+    std::cout << GetHostname() << " | " << GetOSInfo() << "\n";
     std::cout << GetCpuInfo() << "\n";
     std::cout << GetKernelInfo() << "\n";
 
