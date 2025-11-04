@@ -196,7 +196,7 @@ Based on the RMP [PC hardware latency requirements.](https://support.roboticsys.
 - **Bad** (< 1000µs): Inadequate for reliable operation
 - **Pathetic** (≥ 1000µs): Unacceptable, missed deadline
 
-For 1kHz (1000µs period), aim for all samples in "Great" category with max latency < 125µs.  The buckets will scale proportionally for different target periods. 
+For 1kHz (1000µs period), aim for all samples in "Great" category with max latency < 125µs. The buckets will scale proportionally for different target periods. 
 
 ### The CPU frequency check shows a warning - is this a problem?
 
