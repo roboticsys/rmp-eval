@@ -376,6 +376,7 @@ int main(int argc, char* argv[])
     params.ReceiveData = &receiveData;
 
     bool noConfig = false;
+    bool onlyConfig = false;
 
     std::atomic<bool> liveReport = true;
 
@@ -389,6 +390,7 @@ int main(int argc, char* argv[])
     Evaluator::AddArgument(arguments, {"--receive-cpu", "-rc"}, &params.ReceiveCpu, "CPU core to use for the receiver thread");
     Evaluator::AddArgument(arguments, {"--verbose", "-v"}, &params.IsVerbose, "Enable verbose output");
     Evaluator::AddArgument(arguments, {"--no-config", "-nc"}, &noConfig, "Skip system configuration checks");
+    Evaluator::AddArgument(arguments, {"--only-config", "-oc"}, &onlyConfig, "Run system configuration checks only, then exit");
     Evaluator::AddArgument(arguments, {"--bucket-width", "-b"}, &params.BucketWidth, "Bucket width in microseconds for counting occurrences.");
 
     bool showHelp = false;
@@ -415,9 +417,22 @@ int main(int argc, char* argv[])
       return 0;  // Exit after showing version
     }
 
+    // Validate that --no-config and --only-config are not used together
+    if (noConfig && onlyConfig)
+    {
+      std::cerr << "Error: --no-config and --only-config cannot be used together.\n";
+      return 1;
+    }
+
     if (!noConfig)
     {
       Evaluator::ReportSystemConfiguration(params.SendCpu, params.NicName);
+    }
+
+    // If --only-config is specified, exit after configuration checks
+    if (onlyConfig)
+    {
+      return 0;
     }
 
     if (geteuid() != 0)

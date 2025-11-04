@@ -45,6 +45,14 @@ sudo rmp-eval --nic enp2s0
 
 **Note:** The NIC must have an EtherCAT drive connected for this test.
 
+**Check system configuration only (no timing tests):**
+
+```bash
+sudo rmp-eval --only-config
+```
+
+This runs all configuration checks and exits without starting timing threads.
+
 Press `Ctrl+C` to stop the test and view final results.
 
 ## Example Output
@@ -121,6 +129,7 @@ Options:
 --receive-cpu, -rc       CPU core to use for the receiver thread
 --verbose, -v            Enable verbose output
 --no-config, -nc         Skip system configuration checks
+--only-config, -oc       Run system configuration checks only, then exit
 --bucket-width, -b       Bucket width in microseconds for counting occurrences.
 --help, -h               Show this help message
 --version                Show version information
