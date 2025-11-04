@@ -121,16 +121,17 @@ Columns:
 
 Options:
 --nic, -n                Network interface card name
---iterations, -i         Number of iterations
---send-sleep, -s         Send sleep duration in microseconds
---send-priority, -sp     Send thread priority
---receive-priority, -rp  Receive thread priority
---send-cpu, -sc          CPU core to use for the sender thread
---receive-cpu, -rc       CPU core to use for the receiver thread
+--iterations, -i         Number of iterations (default: infinite)
+--send-sleep, -s         Send sleep duration in microseconds (default: 1000)
+--send-priority, -sp     Send thread priority (default: 42)
+--receive-priority, -rp  Receive thread priority (default: 45)
+--send-cpu, -sc          CPU core to use for the sender thread (default: last core)
+--receive-cpu, -rc       CPU core to use for the receiver thread (default: last core)
 --verbose, -v            Enable verbose output
 --no-config, -nc         Skip system configuration checks
 --only-config, -oc       Run system configuration checks only, then exit
---bucket-width, -b       Bucket width in microseconds for counting occurrences.
+--bucket-width, -b       Bucket width in microseconds for counting occurrences (default:
+                         auto).
 --help, -h               Show this help message
 --version                Show version information
 ```

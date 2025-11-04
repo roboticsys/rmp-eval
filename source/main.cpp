@@ -382,16 +382,16 @@ int main(int argc, char* argv[])
 
     std::vector<Evaluator::Argument> arguments;
     Evaluator::AddArgument(arguments, {"--nic", "-n"}, &params.NicName, "Network interface card name");
-    Evaluator::AddArgument(arguments, {"--iterations", "-i"}, &params.Iterations, "Number of iterations");
-    Evaluator::AddArgument(arguments, {"--send-sleep", "-s"}, &params.SendSleep, "Send sleep duration in microseconds");
-    Evaluator::AddArgument(arguments, {"--send-priority", "-sp"}, &params.SendPriority, "Send thread priority");
-    Evaluator::AddArgument(arguments, {"--receive-priority", "-rp"}, &params.ReceivePriority, "Receive thread priority");
-    Evaluator::AddArgument(arguments, {"--send-cpu", "-sc"}, &params.SendCpu, "CPU core to use for the sender thread");
-    Evaluator::AddArgument(arguments, {"--receive-cpu", "-rc"}, &params.ReceiveCpu, "CPU core to use for the receiver thread");
+    Evaluator::AddArgument(arguments, {"--iterations", "-i"}, &params.Iterations, "Number of iterations (default: infinite)");
+    Evaluator::AddArgument(arguments, {"--send-sleep", "-s"}, &params.SendSleep, "Send sleep duration in microseconds (default: " + std::to_string(DefaultSendSleepMicroseconds) + ")");
+    Evaluator::AddArgument(arguments, {"--send-priority", "-sp"}, &params.SendPriority, "Send thread priority (default: " + std::to_string(DefaultSendPriority) + ")");
+    Evaluator::AddArgument(arguments, {"--receive-priority", "-rp"}, &params.ReceivePriority, "Receive thread priority (default: " + std::to_string(DefaultReceivePriority) + ")");
+    Evaluator::AddArgument(arguments, {"--send-cpu", "-sc"}, &params.SendCpu, "CPU core to use for the sender thread (default: last core)");
+    Evaluator::AddArgument(arguments, {"--receive-cpu", "-rc"}, &params.ReceiveCpu, "CPU core to use for the receiver thread (default: last core)");
     Evaluator::AddArgument(arguments, {"--verbose", "-v"}, &params.IsVerbose, "Enable verbose output");
     Evaluator::AddArgument(arguments, {"--no-config", "-nc"}, &noConfig, "Skip system configuration checks");
     Evaluator::AddArgument(arguments, {"--only-config", "-oc"}, &onlyConfig, "Run system configuration checks only, then exit");
-    Evaluator::AddArgument(arguments, {"--bucket-width", "-b"}, &params.BucketWidth, "Bucket width in microseconds for counting occurrences.");
+    Evaluator::AddArgument(arguments, {"--bucket-width", "-b"}, &params.BucketWidth, "Bucket width in microseconds for counting occurrences (default: auto).");
 
     bool showHelp = false;
     Evaluator::AddArgument(arguments, {"--help", "-h"}, &showHelp, "Show this help message");
