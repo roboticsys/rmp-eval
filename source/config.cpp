@@ -218,6 +218,29 @@ namespace
            dataSource.Read(std::string("/sys/class/net/") + nic + "/address");
   }
 
+  [[nodiscard]] std::string ReadNicDriver(const std::string& nic)
+  {
+    std::string driver_path = "/sys/class/net/" + nic + "/device/driver";
+    char buf[PATH_MAX];
+    ssize_t len = readlink(driver_path.c_str(), buf, sizeof(buf) - 1);
+    if (len > 0)
+    {
+      buf[len] = '\0';
+      std::string driver(buf);
+      auto pos = driver.rfind('/');
+      if (pos != std::string::npos) driver = driver.substr(pos + 1);
+      return driver;
+    }
+    return {};
+  }
+
+  constexpr std::string_view ZeroCopyDrivers[] = {
+    "i40e", "ice", "ixgbe", "igb", "igc",
+    "mlx4_en", "mlx5_core",
+    "bnxt_en", "nfp", "qede",
+    "virtio_net", "stmmac", "gve"
+  };
+
   // Pretty printing
 
   const char* Color(Evaluator::Status status)
@@ -227,6 +250,7 @@ namespace
       case Evaluator::Status::Pass: return "\033[32m";   // green
       case Evaluator::Status::Fail: return "\033[31m";   // red
       case Evaluator::Status::Unknown: return "\033[33m"; // yellow
+      case Evaluator::Status::Info: return "\033[36m";    // cyan
     }
     return "\033[0m";
   }
@@ -238,6 +262,7 @@ namespace
       case Evaluator::Status::Pass: return "✔️";
       case Evaluator::Status::Fail: return "❌";
       case Evaluator::Status::Unknown: return "❔";
+      case Evaluator::Status::Info: return "ℹ️";
     }
     return "";
   }
@@ -256,7 +281,7 @@ namespace
   
     std::cout << left_side
               << Color(result.status) << Emoji(result.status) << "\033[0m"
-              << (result.status == Evaluator::Status::Pass ? "    " : "   ")  // Extra space for alignment
+              << ((result.status == Evaluator::Status::Pass || result.status == Evaluator::Status::Info) ? "    " : "   ")  // Extra space for alignment
               << result.reason
               << "\n";
   }
@@ -1031,6 +1056,56 @@ namespace Evaluator
     }
   };
 
+  class AfXdpSupportCheck final : public ICheck
+  {
+  public:
+    [[nodiscard]] CheckKind Kind() const noexcept override { return CheckKind::AfXdpSupport; }
+    [[nodiscard]] const std::string& Name() const noexcept override { static const std::string k = "AF_XDP kernel support"; return k; }
+    [[nodiscard]] Domain GetDomain() const noexcept override { return Domain::System; }
+
+    [[nodiscard]] CheckResult Evaluate(const CheckContext&, const IDataSource& dataSource) const override
+    {
+      struct utsname uname_info = {};
+      if (uname(&uname_info) == 0)
+      {
+        std::string release = uname_info.release;
+        if (auto config = dataSource.Read(std::string("/boot/config-") + release))
+        {
+          if (config->find("CONFIG_XDP_SOCKETS=y") != std::string::npos)
+            return { Kind(), Status::Pass, Name(), "CONFIG_XDP_SOCKETS=y" };
+          if (config->find("CONFIG_XDP_SOCKETS=m") != std::string::npos)
+            return { Kind(), Status::Pass, Name(), "CONFIG_XDP_SOCKETS=m" };
+          return { Kind(), Status::Info, Name(), "kernel config lacks AF_XDP support" };
+        }
+      }
+      // Fallback: try /proc/config.gz
+      if (FILE *pipe = popen("/bin/zcat /proc/config.gz 2>/dev/null", "r"))
+      {
+        char buffer[4096];
+        bool found_any = false;
+        while (fgets(buffer, sizeof(buffer), pipe))
+        {
+          found_any = true;
+          std::string_view line(buffer);
+          if (line.find("CONFIG_XDP_SOCKETS=y") != std::string_view::npos)
+          {
+            pclose(pipe);
+            return { Kind(), Status::Pass, Name(), "CONFIG_XDP_SOCKETS=y" };
+          }
+          if (line.find("CONFIG_XDP_SOCKETS=m") != std::string_view::npos)
+          {
+            pclose(pipe);
+            return { Kind(), Status::Pass, Name(), "CONFIG_XDP_SOCKETS=m" };
+          }
+        }
+        pclose(pipe);
+        if (found_any)
+          return { Kind(), Status::Info, Name(), "kernel config lacks AF_XDP support" };
+      }
+      return { Kind(), Status::Info, Name(), "kernel config unavailable" };
+    }
+  };
+
   // Helper functions for system info
 
   std::string GetCpuInfo()
@@ -1089,6 +1164,72 @@ namespace Evaluator
     if (uname(&buffer) == 0)
     {
       output << buffer.sysname << " " << buffer.release << " " << buffer.version << " " << buffer.machine;
+    }
+
+    return output.str();
+  }
+
+  std::string GetNicInfo(std::string_view nic)
+  {
+    std::ostringstream output;
+    output << "NIC: " << nic;
+
+    auto driver = ReadNicDriver(std::string(nic));
+
+    // Try to get hardware description via lspci
+    std::string hw_desc;
+    std::string uevent_path = std::string("/sys/class/net/") + std::string(nic) + "/device/uevent";
+    if (auto uevent = Slurp(uevent_path))
+    {
+      std::string pci_slot;
+      std::istringstream iss(*uevent);
+      std::string line;
+      while (std::getline(iss, line))
+      {
+        if (line.rfind("PCI_SLOT_NAME=", 0) == 0)
+        {
+          pci_slot = line.substr(14);
+          break;
+        }
+      }
+      if (!pci_slot.empty())
+      {
+        std::string cmd = "/usr/bin/lspci -s " + pci_slot + " 2>/dev/null";
+        if (FILE* pipe = popen(cmd.c_str(), "r"))
+        {
+          char buf[512];
+          std::string lspci_out;
+          while (fgets(buf, sizeof(buf), pipe))
+            lspci_out.append(buf);
+          pclose(pipe);
+          // Parse everything after the first ": "
+          auto sep = lspci_out.find(": ");
+          if (sep != std::string::npos)
+            hw_desc = Trim(lspci_out.substr(sep + 2));
+        }
+      }
+    }
+
+    if (!driver.empty() && !hw_desc.empty())
+      output << " (" << driver << ", " << hw_desc << ")";
+    else if (!driver.empty())
+      output << " (" << driver << ")";
+    else if (!hw_desc.empty())
+      output << " (" << hw_desc << ")";
+    else
+      output << " (driver unknown)";
+
+    // Annotate zero-copy support
+    if (!driver.empty())
+    {
+      for (const auto& zc_driver : ZeroCopyDrivers)
+      {
+        if (driver == zc_driver)
+        {
+          output << " \xe2\x80\x94 AF_XDP zero-copy support likely";
+          break;
+        }
+      }
     }
 
     return output.str();
@@ -1194,7 +1335,8 @@ namespace Evaluator
     std::cout << GetHostname() << " | " << GetOSInfo() << "\n";
     std::cout << GetCpuInfo() << "\n";
     std::cout << GetKernelInfo() << "\n";
-
+    if (!nicName.empty())
+      std::cout << GetNicInfo(nicName) << "\n";
 
     PrintSectionHeader("System Checks");
 
@@ -1213,6 +1355,7 @@ namespace Evaluator
     system_checks.emplace_back(std::make_unique<Evaluator::TimerMigrationCheck>());
     system_checks.emplace_back(std::make_unique<Evaluator::RtThrottlingCheck>());
     system_checks.emplace_back(std::make_unique<Evaluator::ClocksourceCheck>());
+    system_checks.emplace_back(std::make_unique<Evaluator::AfXdpSupportCheck>());
 
     for (const auto &check : system_checks)
     {

@@ -45,13 +45,15 @@ namespace Evaluator
     ClocksourceStable,
     SmtSiblingIsolated,
     TimerMigration,
+    AfXdpSupport,
   };
   
   enum class Status
   {
     Pass,
     Fail,
-    Unknown
+    Unknown,
+    Info
   };
   
   struct CheckResult
@@ -94,6 +96,7 @@ namespace Evaluator
 
   std::string GetCpuInfo();
   std::string GetKernelInfo();
+  std::string GetNicInfo(std::string_view nic);
 
   void ReportSystemConfiguration(int cpu, std::string_view nicName = DefaultNicName);
 }
