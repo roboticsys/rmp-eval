@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <charconv>
 #include <cerrno>
 #include <climits>
 #include <cmath>
@@ -27,8 +28,17 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+
+// PR_FUTEX_HASH was added in Linux 6.17. Define if not yet in system headers.
+#ifndef PR_FUTEX_HASH
+#define PR_FUTEX_HASH          76
+#endif
+#ifndef PR_FUTEX_HASH_SET_SLOTS
+#define PR_FUTEX_HASH_SET_SLOTS  1
+#endif
 #include <unistd.h>
 #include <vector>
 
@@ -43,6 +53,38 @@ namespace
   // Both indicate AF_XDP support is available on this kernel.
   constexpr std::string_view ConfigXdpSocketsBuiltin = "CONFIG_XDP_SOCKETS=y";
   constexpr std::string_view ConfigXdpSocketsModule  = "CONFIG_XDP_SOCKETS=m";
+  struct KernelVersion
+  {
+    int major{};
+    int minor{};
+    int patch{};
+  };
+
+  // Parse a kernel version string (e.g. "6.17.1-rt5") using std::from_chars.
+  // Only the leading "major.minor.patch" numeric portion is required;
+  // trailing suffixes like "-rt5" or "-generic" are ignored.
+  [[nodiscard]] std::optional<KernelVersion> ParseKernelVersion(std::string_view release)
+  {
+    KernelVersion version{};
+    const char* ptr   = release.data();
+    const char* end = ptr + release.size();
+
+    auto result = std::from_chars(ptr, end, version.major);
+    if (result.ec != std::errc{} || result.ptr == end || *result.ptr != '.') return std::nullopt;
+
+    result = std::from_chars(result.ptr + 1, end, version.minor);
+    if (result.ec != std::errc{} || result.ptr == end || *result.ptr != '.') return std::nullopt;
+
+    result = std::from_chars(result.ptr + 1, end, version.patch);
+    if (result.ec != std::errc{}) return std::nullopt;
+
+    return version;
+  }
+
+  [[nodiscard]] bool KernelAtLeast(const KernelVersion& version, int major, int minor)
+  {
+    return version.major > major || (version.major == major && version.minor >= minor);
+  }
 
   struct PipeGuard
   {
@@ -1122,6 +1164,42 @@ namespace Evaluator
     }
   };
 
+  class FutexPrivateHashCheck final : public ICheck
+  {
+  public:
+    [[nodiscard]] CheckKind Kind() const noexcept override { return CheckKind::FutexPrivateHash; }
+    [[nodiscard]] const std::string& Name() const noexcept override { static const std::string k = "Private futex hash table"; return k; }
+    [[nodiscard]] Domain GetDomain() const noexcept override { return Domain::System; }
+
+    [[nodiscard]] CheckResult Evaluate(const CheckContext&, const IDataSource&) const override
+    {
+      // Check kernel version first for a useful diagnostic message.
+      struct utsname unameInfo = {};
+      std::string versionStr = "unknown";
+      bool versionOk = false;
+      if (uname(&unameInfo) == 0)
+      {
+        versionStr = unameInfo.release;
+        if (auto version = ParseKernelVersion(versionStr))
+          versionOk = KernelAtLeast(*version, 6, 17);
+      }
+
+      // Probe the running kernel — this is the authoritative test.
+      int ret = prctl(PR_FUTEX_HASH, PR_FUTEX_HASH_SET_SLOTS, 0, 0, 0);
+      if (ret == 0)
+        return { Kind(), Status::Pass, Name(), "prctl(PR_FUTEX_HASH) succeeded (kernel " + versionStr + ")" };
+
+      // prctl failed — provide context-aware diagnostics.
+      if (!versionOk)
+        return { Kind(), Status::Fail, Name(),
+          "kernel " + versionStr + " < 6.17; private futex hash requires >= 6.17" };
+
+      return { Kind(), Status::Fail, Name(),
+        "kernel " + versionStr + " >= 6.17 but prctl(PR_FUTEX_HASH) failed (errno "
+        + std::to_string(errno) + "); CONFIG_FUTEX_PRIVATE_HASH may be disabled" };
+    }
+  };
+
   // Helper functions for system info
 
   std::string GetCpuInfo()
@@ -1377,6 +1455,7 @@ namespace Evaluator
     system_checks.emplace_back(std::make_unique<Evaluator::RtThrottlingCheck>());
     system_checks.emplace_back(std::make_unique<Evaluator::ClocksourceCheck>());
     system_checks.emplace_back(std::make_unique<Evaluator::AfXdpSupportCheck>());
+    system_checks.emplace_back(std::make_unique<Evaluator::FutexPrivateHashCheck>());
 
     for (const auto &check : system_checks)
     {
