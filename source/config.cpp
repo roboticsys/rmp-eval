@@ -39,6 +39,9 @@
 #ifndef PR_FUTEX_HASH_SET_SLOTS
 #define PR_FUTEX_HASH_SET_SLOTS  1
 #endif
+#ifndef PR_FUTEX_HASH_GET_SLOTS
+#define PR_FUTEX_HASH_GET_SLOTS  2
+#endif
 #include <unistd.h>
 #include <vector>
 
@@ -1173,33 +1176,35 @@ namespace Evaluator
 
     [[nodiscard]] CheckResult Evaluate(const CheckContext&, const IDataSource&) const override
     {
-      // Check kernel version first for a useful diagnostic message.
+      // Parse the running kernel version for diagnostics and gating.
       struct utsname unameInfo = {};
       std::string versionStr = "unknown";
       bool versionOk = false;
       if (uname(&unameInfo) == 0)
       {
         versionStr = unameInfo.release;
-        if (auto version = ParseKernelVersion(versionStr))
-          versionOk = KernelAtLeast(*version, 6, 17);
+        if (auto kv = ParseKernelVersion(versionStr))
+          versionOk = KernelAtLeast(*kv, 6, 17);
       }
 
-      // Probe the running kernel — this is the authoritative test.
-      static constexpr int DefaultSlots = 16; // The default number of futex hash slots in the kernel as of 6.17
-      int ret = prctl(PR_FUTEX_HASH, PR_FUTEX_HASH_SET_SLOTS, DefaultSlots, 0, 0);
-      if (ret >= 0) // prctl returns a nonnegative value on success.
-        return { Kind(), Status::Pass, Name(), "prctl(PR_FUTEX_HASH) succeeded (kernel " + versionStr + ")" };
-
-
-      // prctl failed — provide context-aware diagnostics.
+      // No point calling prctl on a kernel that predates the feature.
       if (!versionOk)
         return { Kind(), Status::Fail, Name(),
           "kernel " + versionStr + " < 6.17; private futex hash requires >= 6.17" };
 
+      // Probe the running kernel — this is the authoritative test.
+      // PR_FUTEX_HASH_GET_SLOTS is a read-only query with no side effects.
+      int ret = prctl(PR_FUTEX_HASH, PR_FUTEX_HASH_GET_SLOTS, 0, 0, 0);
+      // The return value may be 0, indicating the PR_FUTEX_HASH operation is valid
+      // but the kernel hasn't created the default 16 slots yet (on the first thread creation).
+      // https://man7.org/linux/man-pages/man2/PR_FUTEX_HASH.2const.html
+      if (ret >= 0)
+        return { Kind(), Status::Pass, Name(), "prctl(PR_FUTEX_HASH) succeeded;" };
+
       static constexpr size_t BufferSize = 256;
       char buffer[BufferSize]{};
       std::snprintf(buffer, BufferSize,
-        "Kernel %s version >= 6.17, but prctl(PR_FUTEX_HASH) failed with errno %d: %s; CONFIG_FUTEX_PRIVATE_HASH may be disabled",
+        "kernel %s >= 6.17 but prctl(PR_FUTEX_HASH) failed (errno %d: %s)",
         versionStr.c_str(), errno, strerror(errno));
       return { Kind(), Status::Fail, Name(), std::string(buffer) };
     }
