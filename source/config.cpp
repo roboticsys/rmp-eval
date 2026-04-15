@@ -34,7 +34,7 @@
 
 // PR_FUTEX_HASH was added in Linux 6.17. Define if not yet in system headers.
 #ifndef PR_FUTEX_HASH
-#define PR_FUTEX_HASH          76
+#define PR_FUTEX_HASH          78
 #endif
 #ifndef PR_FUTEX_HASH_SET_SLOTS
 #define PR_FUTEX_HASH_SET_SLOTS  1
@@ -1185,18 +1185,23 @@ namespace Evaluator
       }
 
       // Probe the running kernel — this is the authoritative test.
-      int ret = prctl(PR_FUTEX_HASH, PR_FUTEX_HASH_SET_SLOTS, 0, 0, 0);
-      if (ret == 0)
+      static constexpr int DefaultSlots = 16; // The default number of futex hash slots in the kernel as of 6.17
+      int ret = prctl(PR_FUTEX_HASH, PR_FUTEX_HASH_SET_SLOTS, DefaultSlots, 0, 0);
+      if (ret >= 0) // prctl returns a nonnegative value on success.
         return { Kind(), Status::Pass, Name(), "prctl(PR_FUTEX_HASH) succeeded (kernel " + versionStr + ")" };
+
 
       // prctl failed — provide context-aware diagnostics.
       if (!versionOk)
         return { Kind(), Status::Fail, Name(),
           "kernel " + versionStr + " < 6.17; private futex hash requires >= 6.17" };
 
-      return { Kind(), Status::Fail, Name(),
-        "kernel " + versionStr + " >= 6.17 but prctl(PR_FUTEX_HASH) failed (errno "
-        + std::to_string(errno) + "); CONFIG_FUTEX_PRIVATE_HASH may be disabled" };
+      static constexpr size_t BufferSize = 256;
+      char buffer[BufferSize]{};
+      std::snprintf(buffer, BufferSize,
+        "Kernel %s version >= 6.17, but prctl(PR_FUTEX_HASH) failed with errno %d: %s; CONFIG_FUTEX_PRIVATE_HASH may be disabled",
+        versionStr.c_str(), errno, strerror(errno));
+      return { Kind(), Status::Fail, Name(), std::string(buffer) };
     }
   };
 
