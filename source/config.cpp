@@ -37,6 +37,24 @@ namespace fs = std::filesystem;
 // Small utility and helper functions
 namespace
 {
+  constexpr std::string_view SysClassNet = "/sys/class/net/";
+  constexpr std::string_view PciSlotNamePrefix = "PCI_SLOT_NAME=";
+  // =y means built into the kernel; =m means built as a loadable kernel module.
+  // Both indicate AF_XDP support is available on this kernel.
+  constexpr std::string_view ConfigXdpSocketsBuiltin = "CONFIG_XDP_SOCKETS=y";
+  constexpr std::string_view ConfigXdpSocketsModule  = "CONFIG_XDP_SOCKETS=m";
+
+  struct PipeGuard
+  {
+    FILE* pipe{nullptr};
+    explicit PipeGuard(FILE* p) : pipe(p) {}
+    ~PipeGuard() { if (pipe) pclose(pipe); }
+    PipeGuard(const PipeGuard&) = delete;
+    PipeGuard& operator=(const PipeGuard&) = delete;
+    explicit operator bool() const { return pipe != nullptr; }
+    FILE* get() const { return pipe; }
+  };
+
   [[nodiscard]] std::string Trim(std::string str)
   {
     auto notspace = [](unsigned char ch) { return !std::isspace(ch); };
@@ -135,16 +153,15 @@ namespace
   [[nodiscard]] std::string CpuModelString()
   {
     // Try lscpu first (if available)
-    if (FILE *pipe = popen("LC_ALL=C lscpu 2>/dev/null", "r"))
+    if (PipeGuard pg{popen("LC_ALL=C lscpu 2>/dev/null", "r")}; pg)
     {
       std::string output;
       char buffer[512];
-      while (fgets(buffer, sizeof(buffer), pipe))
+      while (fgets(buffer, sizeof(buffer), pg.get()))
       {
         output.append(buffer);
-    if (output.size() > static_cast<size_t>(Evaluator::MaxOutputSize)) break;
+        if (output.size() > static_cast<size_t>(Evaluator::MaxOutputSize)) break;
       }
-      pclose(pipe);
       if (!output.empty())
       {
         std::istringstream lscpu_stream(output);
@@ -213,10 +230,36 @@ namespace
 
   bool NicExists(const Evaluator::IDataSource& dataSource, const std::string& nic)
   {
-    return dataSource.Read(std::string("/sys/class/net/") + nic + "/operstate") ||
-           dataSource.Read(std::string("/sys/class/net/") + nic + "/carrier") ||
-           dataSource.Read(std::string("/sys/class/net/") + nic + "/address");
+    return dataSource.Read(std::string(SysClassNet) + nic + "/operstate") ||
+           dataSource.Read(std::string(SysClassNet) + nic + "/carrier") ||
+           dataSource.Read(std::string(SysClassNet) + nic + "/address");
   }
+
+  [[nodiscard]] std::string ReadNicDriver(const std::string& nic)
+  {
+    std::string driverPath = std::string(SysClassNet) + nic + "/device/driver";
+    char buf[PATH_MAX];
+    ssize_t len = readlink(driverPath.c_str(), buf, sizeof(buf) - 1);
+    if (len > 0)
+    {
+      buf[len] = '\0';
+      std::string driver(buf);
+      auto pos = driver.rfind('/');
+      if (pos != std::string::npos) driver = driver.substr(pos + 1);
+      return driver;
+    }
+    return {};
+  }
+
+  // Drivers known to implement AF_XDP zero-copy (XDP_SETUP_XSK_POOL in their
+  // ndo_bpf handler) derived from a walk of the in-tree net drivers in
+  // drivers/net/ethernet/ and drivers/net/ in a recent Linux 6.x kernel.
+  constexpr std::string_view ZeroCopyDrivers[] = {
+    "i40e", "ice", "ixgbe", "igb", "igc",
+    "mlx4_en", "mlx5_core",
+    "bnxt_en", "nfp", "qede",
+    "virtio_net", "stmmac", "gve"
+  };
 
   // Pretty printing
 
@@ -227,6 +270,7 @@ namespace
       case Evaluator::Status::Pass: return "\033[32m";   // green
       case Evaluator::Status::Fail: return "\033[31m";   // red
       case Evaluator::Status::Unknown: return "\033[33m"; // yellow
+      case Evaluator::Status::Info: return "\033[36m";    // cyan
     }
     return "\033[0m";
   }
@@ -238,6 +282,7 @@ namespace
       case Evaluator::Status::Pass: return "✔️";
       case Evaluator::Status::Fail: return "❌";
       case Evaluator::Status::Unknown: return "❔";
+      case Evaluator::Status::Info: return "ℹ️";
     }
     return "";
   }
@@ -256,7 +301,7 @@ namespace
   
     std::cout << left_side
               << Color(result.status) << Emoji(result.status) << "\033[0m"
-              << (result.status == Evaluator::Status::Pass ? "    " : "   ")  // Extra space for alignment
+              << ((result.status == Evaluator::Status::Pass || result.status == Evaluator::Status::Info) ? "    " : "   ")  // Extra space for alignment
               << result.reason
               << "\n";
   }
@@ -346,13 +391,13 @@ namespace Evaluator
       {
         return { Kind(), Status::Unknown, Name(), "NIC not found" };
       }
-      if (auto oper = dataSource.Read(std::string("/sys/class/net/") + nic + "/operstate"))
+      if (auto oper = dataSource.Read(std::string(SysClassNet) + nic + "/operstate"))
       {
         auto v = Trim(*oper);
         if (v == "up") return { Kind(), Status::Pass, Name(), "operstate=up" };
         if (!v.empty()) return { Kind(), Status::Fail, Name(), std::string("operstate=") + v };
       }
-      if (auto car = dataSource.Read(std::string("/sys/class/net/") + nic + "/carrier"))
+      if (auto car = dataSource.Read(std::string(SysClassNet) + nic + "/carrier"))
       {
         auto v = Trim(*car);
         if (v == "1") return { Kind(), Status::Pass, Name(), "carrier=1" };
@@ -1031,6 +1076,52 @@ namespace Evaluator
     }
   };
 
+  class AfXdpSupportCheck final : public ICheck
+  {
+  public:
+    [[nodiscard]] CheckKind Kind() const noexcept override { return CheckKind::AfXdpSupport; }
+    [[nodiscard]] const std::string& Name() const noexcept override { static const std::string k = "AF_XDP kernel support"; return k; }
+    [[nodiscard]] Domain GetDomain() const noexcept override { return Domain::System; }
+
+    [[nodiscard]] CheckResult Evaluate(const CheckContext&, const IDataSource& dataSource) const override
+    {
+      struct utsname unameInfo = {};
+      if (uname(&unameInfo) == 0)
+      {
+        std::string release = unameInfo.release;
+        if (auto config = dataSource.Read(std::string("/boot/config-") + release))
+        {
+          if (config->find(ConfigXdpSocketsBuiltin) != std::string::npos)
+            return { Kind(), Status::Pass, Name(), std::string(ConfigXdpSocketsBuiltin) };
+          if (config->find(ConfigXdpSocketsModule) != std::string::npos)
+            return { Kind(), Status::Pass, Name(), std::string(ConfigXdpSocketsModule) };
+          return { Kind(), Status::Info, Name(), "kernel config lacks AF_XDP support" };
+        }
+      }
+      // Fallback: try /proc/config.gz. Note that the decompressed kernel
+      // config is ~250KB on a typical x86_64 distro kernel — much larger than
+      // the other popen reads in this file — so we stream line-by-line and
+      // early-return on match rather than capping at Evaluator::MaxOutputSize.
+      if (PipeGuard pg{popen("/bin/zcat /proc/config.gz 2>/dev/null", "r")}; pg)
+      {
+        char buffer[Evaluator::ReadBufferSize];
+        bool foundAny = false;
+        while (fgets(buffer, sizeof(buffer), pg.get()))
+        {
+          foundAny = true;
+          std::string_view line(buffer);
+          if (line.find(ConfigXdpSocketsBuiltin) != std::string_view::npos)
+            return { Kind(), Status::Pass, Name(), std::string(ConfigXdpSocketsBuiltin) };
+          if (line.find(ConfigXdpSocketsModule) != std::string_view::npos)
+            return { Kind(), Status::Pass, Name(), std::string(ConfigXdpSocketsModule) };
+        }
+        if (foundAny)
+          return { Kind(), Status::Info, Name(), "kernel config lacks AF_XDP support" };
+      }
+      return { Kind(), Status::Info, Name(), "kernel config unavailable" };
+    }
+  };
+
   // Helper functions for system info
 
   std::string GetCpuInfo()
@@ -1089,6 +1180,77 @@ namespace Evaluator
     if (uname(&buffer) == 0)
     {
       output << buffer.sysname << " " << buffer.release << " " << buffer.version << " " << buffer.machine;
+    }
+
+    return output.str();
+  }
+
+  std::string GetNicInfo(std::string nic)
+  {
+    std::ostringstream output;
+    output << "NIC: " << nic;
+
+    auto driver = ReadNicDriver(nic);
+
+    // Try to get hardware description via lspci
+    std::string hwDesc;
+    std::string ueventPath = std::string(SysClassNet) + nic + "/device/uevent";
+    if (auto uevent = Slurp(ueventPath))
+    {
+      std::string pciSlot;
+      std::istringstream iss(*uevent);
+      std::string line;
+      while (std::getline(iss, line))
+      {
+        if (line.rfind(PciSlotNamePrefix, 0) == 0)
+        {
+          pciSlot = line.substr(PciSlotNamePrefix.size());
+          break;
+        }
+      }
+      // Defense-in-depth: PCI_SLOT_NAME comes from kernel-controlled sysfs,
+      // but validate the charset before interpolating into a shell command.
+      if (!pciSlot.empty() &&
+          pciSlot.find_first_not_of("0123456789abcdefABCDEF:.") == std::string::npos)
+      {
+        std::string cmd = "/usr/bin/lspci -s " + pciSlot + " 2>/dev/null";
+        if (PipeGuard pg{popen(cmd.c_str(), "r")}; pg)
+        {
+          char buffer[Evaluator::ReadBufferSize];
+          std::string lspciOut;
+          while (fgets(buffer, sizeof(buffer), pg.get()))
+          {
+            lspciOut.append(buffer);
+            if (lspciOut.size() > static_cast<size_t>(Evaluator::MaxOutputSize)) break;
+          }
+          // Parse everything after the first ": "
+          auto sep = lspciOut.find(": ");
+          if (sep != std::string::npos)
+            hwDesc = Trim(lspciOut.substr(sep + 2));
+        }
+      }
+    }
+
+    if (!driver.empty() && !hwDesc.empty())
+      output << " (" << driver << ", " << hwDesc << ")";
+    else if (!driver.empty())
+      output << " (" << driver << ")";
+    else if (!hwDesc.empty())
+      output << " (" << hwDesc << ")";
+    else
+      output << " (driver unknown)";
+
+    // Annotate zero-copy support
+    if (!driver.empty())
+    {
+      for (const auto& zcDriver : ZeroCopyDrivers)
+      {
+        if (driver == zcDriver)
+        {
+          output << " \xe2\x80\x94 AF_XDP zero-copy support likely";
+          break;
+        }
+      }
     }
 
     return output.str();
@@ -1194,7 +1356,8 @@ namespace Evaluator
     std::cout << GetHostname() << " | " << GetOSInfo() << "\n";
     std::cout << GetCpuInfo() << "\n";
     std::cout << GetKernelInfo() << "\n";
-
+    if (!nicName.empty())
+      std::cout << GetNicInfo(std::string(nicName)) << "\n";
 
     PrintSectionHeader("System Checks");
 
@@ -1213,6 +1376,7 @@ namespace Evaluator
     system_checks.emplace_back(std::make_unique<Evaluator::TimerMigrationCheck>());
     system_checks.emplace_back(std::make_unique<Evaluator::RtThrottlingCheck>());
     system_checks.emplace_back(std::make_unique<Evaluator::ClocksourceCheck>());
+    system_checks.emplace_back(std::make_unique<Evaluator::AfXdpSupportCheck>());
 
     for (const auto &check : system_checks)
     {

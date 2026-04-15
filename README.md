@@ -62,6 +62,7 @@ sudo ./rmp-eval --nic enp2s0
 
 CPU: 13th Gen Intel(R) Core(TM) i3-13100TE (4 logical, 4 physical)
 Kernel: Linux 6.12.43+deb13-rt-amd64 #1 SMP PREEMPT_RT Debian 6.12.43-1 (2025-08-27) x86_64
+NIC: enp2s0 (igc, Intel Corporation Ethernet Controller I226-V (rev 04)) — AF_XDP zero-copy support likely
 
 System Checks
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -70,6 +71,7 @@ Swap disabled                       ✔️    /proc/swaps empty
 Timer Migration disabled            ✔️    timer_migration=0
 RT throttling disabled              ✔️    sched_rt_runtime_us=-1
 Clocksource stable                  ✔️    tsc
+AF_XDP kernel support               ✔️    CONFIG_XDP_SOCKETS=y
 
 Core 3 Checks
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
