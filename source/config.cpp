@@ -37,6 +37,19 @@ namespace fs = std::filesystem;
 // Small utility and helper functions
 namespace
 {
+  static constexpr std::string_view kSysClassNet = "/sys/class/net/";
+
+  struct PipeGuard
+  {
+    FILE* pipe{nullptr};
+    explicit PipeGuard(FILE* p) : pipe(p) {}
+    ~PipeGuard() { if (pipe) pclose(pipe); }
+    PipeGuard(const PipeGuard&) = delete;
+    PipeGuard& operator=(const PipeGuard&) = delete;
+    explicit operator bool() const { return pipe != nullptr; }
+    FILE* get() const { return pipe; }
+  };
+
   [[nodiscard]] std::string Trim(std::string str)
   {
     auto notspace = [](unsigned char ch) { return !std::isspace(ch); };
@@ -135,16 +148,15 @@ namespace
   [[nodiscard]] std::string CpuModelString()
   {
     // Try lscpu first (if available)
-    if (FILE *pipe = popen("LC_ALL=C lscpu 2>/dev/null", "r"))
+    if (PipeGuard pg{popen("LC_ALL=C lscpu 2>/dev/null", "r")}; pg)
     {
       std::string output;
       char buffer[512];
-      while (fgets(buffer, sizeof(buffer), pipe))
+      while (fgets(buffer, sizeof(buffer), pg.get()))
       {
         output.append(buffer);
-    if (output.size() > static_cast<size_t>(Evaluator::MaxOutputSize)) break;
+        if (output.size() > static_cast<size_t>(Evaluator::MaxOutputSize)) break;
       }
-      pclose(pipe);
       if (!output.empty())
       {
         std::istringstream lscpu_stream(output);
@@ -213,16 +225,16 @@ namespace
 
   bool NicExists(const Evaluator::IDataSource& dataSource, const std::string& nic)
   {
-    return dataSource.Read(std::string("/sys/class/net/") + nic + "/operstate") ||
-           dataSource.Read(std::string("/sys/class/net/") + nic + "/carrier") ||
-           dataSource.Read(std::string("/sys/class/net/") + nic + "/address");
+    return dataSource.Read(std::string(kSysClassNet) + nic + "/operstate") ||
+           dataSource.Read(std::string(kSysClassNet) + nic + "/carrier") ||
+           dataSource.Read(std::string(kSysClassNet) + nic + "/address");
   }
 
   [[nodiscard]] std::string ReadNicDriver(const std::string& nic)
   {
-    std::string driver_path = "/sys/class/net/" + nic + "/device/driver";
+    std::string driverPath = std::string(kSysClassNet) + nic + "/device/driver";
     char buf[PATH_MAX];
-    ssize_t len = readlink(driver_path.c_str(), buf, sizeof(buf) - 1);
+    ssize_t len = readlink(driverPath.c_str(), buf, sizeof(buf) - 1);
     if (len > 0)
     {
       buf[len] = '\0';
@@ -234,6 +246,9 @@ namespace
     return {};
   }
 
+  // Drivers known to implement AF_XDP zero-copy (XDP_SETUP_XSK_POOL in their
+  // ndo_bpf handler) derived from a walk of the in-tree net drivers in
+  // drivers/net/ethernet/ and drivers/net/ in a recent Linux 6.x kernel.
   constexpr std::string_view ZeroCopyDrivers[] = {
     "i40e", "ice", "ixgbe", "igb", "igc",
     "mlx4_en", "mlx5_core",
@@ -371,13 +386,13 @@ namespace Evaluator
       {
         return { Kind(), Status::Unknown, Name(), "NIC not found" };
       }
-      if (auto oper = dataSource.Read(std::string("/sys/class/net/") + nic + "/operstate"))
+      if (auto oper = dataSource.Read(std::string(kSysClassNet) + nic + "/operstate"))
       {
         auto v = Trim(*oper);
         if (v == "up") return { Kind(), Status::Pass, Name(), "operstate=up" };
         if (!v.empty()) return { Kind(), Status::Fail, Name(), std::string("operstate=") + v };
       }
-      if (auto car = dataSource.Read(std::string("/sys/class/net/") + nic + "/carrier"))
+      if (auto car = dataSource.Read(std::string(kSysClassNet) + nic + "/carrier"))
       {
         auto v = Trim(*car);
         if (v == "1") return { Kind(), Status::Pass, Name(), "carrier=1" };
@@ -1065,10 +1080,10 @@ namespace Evaluator
 
     [[nodiscard]] CheckResult Evaluate(const CheckContext&, const IDataSource& dataSource) const override
     {
-      struct utsname uname_info = {};
-      if (uname(&uname_info) == 0)
+      struct utsname unameInfo = {};
+      if (uname(&unameInfo) == 0)
       {
-        std::string release = uname_info.release;
+        std::string release = unameInfo.release;
         if (auto config = dataSource.Read(std::string("/boot/config-") + release))
         {
           if (config->find("CONFIG_XDP_SOCKETS=y") != std::string::npos)
@@ -1079,27 +1094,20 @@ namespace Evaluator
         }
       }
       // Fallback: try /proc/config.gz
-      if (FILE *pipe = popen("/bin/zcat /proc/config.gz 2>/dev/null", "r"))
+      if (PipeGuard pg{popen("/bin/zcat /proc/config.gz 2>/dev/null", "r")}; pg)
       {
         char buffer[4096];
-        bool found_any = false;
-        while (fgets(buffer, sizeof(buffer), pipe))
+        bool foundAny = false;
+        while (fgets(buffer, sizeof(buffer), pg.get()))
         {
-          found_any = true;
+          foundAny = true;
           std::string_view line(buffer);
           if (line.find("CONFIG_XDP_SOCKETS=y") != std::string_view::npos)
-          {
-            pclose(pipe);
             return { Kind(), Status::Pass, Name(), "CONFIG_XDP_SOCKETS=y" };
-          }
           if (line.find("CONFIG_XDP_SOCKETS=m") != std::string_view::npos)
-          {
-            pclose(pipe);
             return { Kind(), Status::Pass, Name(), "CONFIG_XDP_SOCKETS=m" };
-          }
         }
-        pclose(pipe);
-        if (found_any)
+        if (foundAny)
           return { Kind(), Status::Info, Name(), "kernel config lacks AF_XDP support" };
       }
       return { Kind(), Status::Info, Name(), "kernel config unavailable" };
@@ -1177,54 +1185,59 @@ namespace Evaluator
     auto driver = ReadNicDriver(std::string(nic));
 
     // Try to get hardware description via lspci
-    std::string hw_desc;
-    std::string uevent_path = std::string("/sys/class/net/") + std::string(nic) + "/device/uevent";
-    if (auto uevent = Slurp(uevent_path))
+    std::string hwDesc;
+    std::string ueventPath = std::string(kSysClassNet) + std::string(nic) + "/device/uevent";
+    if (auto uevent = Slurp(ueventPath))
     {
-      std::string pci_slot;
+      std::string pciSlot;
       std::istringstream iss(*uevent);
       std::string line;
       while (std::getline(iss, line))
       {
         if (line.rfind("PCI_SLOT_NAME=", 0) == 0)
         {
-          pci_slot = line.substr(14);
+          pciSlot = line.substr(14);
           break;
         }
       }
-      if (!pci_slot.empty())
+      // Defense-in-depth: PCI_SLOT_NAME comes from kernel-controlled sysfs,
+      // but validate the charset before interpolating into a shell command.
+      if (!pciSlot.empty() &&
+          pciSlot.find_first_not_of("0123456789abcdefABCDEF:.") == std::string::npos)
       {
-        std::string cmd = "/usr/bin/lspci -s " + pci_slot + " 2>/dev/null";
-        if (FILE* pipe = popen(cmd.c_str(), "r"))
+        std::string cmd = "/usr/bin/lspci -s " + pciSlot + " 2>/dev/null";
+        if (PipeGuard pg{popen(cmd.c_str(), "r")}; pg)
         {
           char buf[512];
-          std::string lspci_out;
-          while (fgets(buf, sizeof(buf), pipe))
-            lspci_out.append(buf);
-          pclose(pipe);
+          std::string lspciOut;
+          while (fgets(buf, sizeof(buf), pg.get()))
+          {
+            lspciOut.append(buf);
+            if (lspciOut.size() > static_cast<size_t>(Evaluator::MaxOutputSize)) break;
+          }
           // Parse everything after the first ": "
-          auto sep = lspci_out.find(": ");
+          auto sep = lspciOut.find(": ");
           if (sep != std::string::npos)
-            hw_desc = Trim(lspci_out.substr(sep + 2));
+            hwDesc = Trim(lspciOut.substr(sep + 2));
         }
       }
     }
 
-    if (!driver.empty() && !hw_desc.empty())
-      output << " (" << driver << ", " << hw_desc << ")";
+    if (!driver.empty() && !hwDesc.empty())
+      output << " (" << driver << ", " << hwDesc << ")";
     else if (!driver.empty())
       output << " (" << driver << ")";
-    else if (!hw_desc.empty())
-      output << " (" << hw_desc << ")";
+    else if (!hwDesc.empty())
+      output << " (" << hwDesc << ")";
     else
       output << " (driver unknown)";
 
     // Annotate zero-copy support
     if (!driver.empty())
     {
-      for (const auto& zc_driver : ZeroCopyDrivers)
+      for (const auto& zcDriver : ZeroCopyDrivers)
       {
-        if (driver == zc_driver)
+        if (driver == zcDriver)
         {
           output << " \xe2\x80\x94 AF_XDP zero-copy support likely";
           break;
