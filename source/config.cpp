@@ -5,8 +5,8 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
-#include <charconv>
 #include <cerrno>
+#include <charconv>
 #include <climits>
 #include <cmath>
 #include <cstdarg>
@@ -76,11 +76,13 @@ namespace
     if (result.ec != std::errc{} || result.ptr == end || *result.ptr != '.') return std::nullopt;
 
     result = std::from_chars(result.ptr + 1, end, version.minor);
-    if (result.ec != std::errc{} || result.ptr == end || *result.ptr != '.') return std::nullopt;
-
-    result = std::from_chars(result.ptr + 1, end, version.patch);
     if (result.ec != std::errc{}) return std::nullopt;
 
+    // Patch level is optional, still return if it's missing or fails to parse.
+    if (result.ptr < end && *result.ptr == '.')
+    {
+      result = std::from_chars(result.ptr + 1, end, version.patch);
+    }
     return version;
   }
 
