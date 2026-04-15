@@ -1098,7 +1098,10 @@ namespace Evaluator
           return { Kind(), Status::Info, Name(), "kernel config lacks AF_XDP support" };
         }
       }
-      // Fallback: try /proc/config.gz
+      // Fallback: try /proc/config.gz. Note that the decompressed kernel
+      // config is ~250KB on a typical x86_64 distro kernel — much larger than
+      // the other popen reads in this file — so we stream line-by-line and
+      // early-return on match rather than capping at Evaluator::MaxOutputSize.
       if (PipeGuard pg{popen("/bin/zcat /proc/config.gz 2>/dev/null", "r")}; pg)
       {
         char buffer[Evaluator::ReadBufferSize];
