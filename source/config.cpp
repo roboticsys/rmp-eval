@@ -1213,11 +1213,11 @@ namespace Evaluator
         std::string cmd = "/usr/bin/lspci -s " + pciSlot + " 2>/dev/null";
         if (PipeGuard pg{popen(cmd.c_str(), "r")}; pg)
         {
-          char buf[512];
+          char buffer[Evaluator::ReadBufferSize];
           std::string lspciOut;
-          while (fgets(buf, sizeof(buf), pg.get()))
+          while (fgets(buffer, sizeof(buffer), pg.get()))
           {
-            lspciOut.append(buf);
+            lspciOut.append(buffer);
             if (lspciOut.size() > static_cast<size_t>(Evaluator::MaxOutputSize)) break;
           }
           // Parse everything after the first ": "
