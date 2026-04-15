@@ -96,7 +96,7 @@ namespace Evaluator
 
   std::string GetCpuInfo();
   std::string GetKernelInfo();
-  std::string GetNicInfo(std::string_view nic);
+  std::string GetNicInfo(std::string nic);
 
   void ReportSystemConfiguration(int cpu, std::string_view nicName = DefaultNicName);
 }

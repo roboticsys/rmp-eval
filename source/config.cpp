@@ -37,7 +37,12 @@ namespace fs = std::filesystem;
 // Small utility and helper functions
 namespace
 {
-  static constexpr std::string_view kSysClassNet = "/sys/class/net/";
+  constexpr std::string_view SysClassNet = "/sys/class/net/";
+  constexpr std::string_view PciSlotNamePrefix = "PCI_SLOT_NAME=";
+  // =y means built into the kernel; =m means built as a loadable kernel module.
+  // Both indicate AF_XDP support is available on this kernel.
+  constexpr std::string_view ConfigXdpSocketsBuiltin = "CONFIG_XDP_SOCKETS=y";
+  constexpr std::string_view ConfigXdpSocketsModule  = "CONFIG_XDP_SOCKETS=m";
 
   struct PipeGuard
   {
@@ -225,14 +230,14 @@ namespace
 
   bool NicExists(const Evaluator::IDataSource& dataSource, const std::string& nic)
   {
-    return dataSource.Read(std::string(kSysClassNet) + nic + "/operstate") ||
-           dataSource.Read(std::string(kSysClassNet) + nic + "/carrier") ||
-           dataSource.Read(std::string(kSysClassNet) + nic + "/address");
+    return dataSource.Read(std::string(SysClassNet) + nic + "/operstate") ||
+           dataSource.Read(std::string(SysClassNet) + nic + "/carrier") ||
+           dataSource.Read(std::string(SysClassNet) + nic + "/address");
   }
 
   [[nodiscard]] std::string ReadNicDriver(const std::string& nic)
   {
-    std::string driverPath = std::string(kSysClassNet) + nic + "/device/driver";
+    std::string driverPath = std::string(SysClassNet) + nic + "/device/driver";
     char buf[PATH_MAX];
     ssize_t len = readlink(driverPath.c_str(), buf, sizeof(buf) - 1);
     if (len > 0)
@@ -386,13 +391,13 @@ namespace Evaluator
       {
         return { Kind(), Status::Unknown, Name(), "NIC not found" };
       }
-      if (auto oper = dataSource.Read(std::string(kSysClassNet) + nic + "/operstate"))
+      if (auto oper = dataSource.Read(std::string(SysClassNet) + nic + "/operstate"))
       {
         auto v = Trim(*oper);
         if (v == "up") return { Kind(), Status::Pass, Name(), "operstate=up" };
         if (!v.empty()) return { Kind(), Status::Fail, Name(), std::string("operstate=") + v };
       }
-      if (auto car = dataSource.Read(std::string(kSysClassNet) + nic + "/carrier"))
+      if (auto car = dataSource.Read(std::string(SysClassNet) + nic + "/carrier"))
       {
         auto v = Trim(*car);
         if (v == "1") return { Kind(), Status::Pass, Name(), "carrier=1" };
@@ -1086,26 +1091,26 @@ namespace Evaluator
         std::string release = unameInfo.release;
         if (auto config = dataSource.Read(std::string("/boot/config-") + release))
         {
-          if (config->find("CONFIG_XDP_SOCKETS=y") != std::string::npos)
-            return { Kind(), Status::Pass, Name(), "CONFIG_XDP_SOCKETS=y" };
-          if (config->find("CONFIG_XDP_SOCKETS=m") != std::string::npos)
-            return { Kind(), Status::Pass, Name(), "CONFIG_XDP_SOCKETS=m" };
+          if (config->find(ConfigXdpSocketsBuiltin) != std::string::npos)
+            return { Kind(), Status::Pass, Name(), std::string(ConfigXdpSocketsBuiltin) };
+          if (config->find(ConfigXdpSocketsModule) != std::string::npos)
+            return { Kind(), Status::Pass, Name(), std::string(ConfigXdpSocketsModule) };
           return { Kind(), Status::Info, Name(), "kernel config lacks AF_XDP support" };
         }
       }
       // Fallback: try /proc/config.gz
       if (PipeGuard pg{popen("/bin/zcat /proc/config.gz 2>/dev/null", "r")}; pg)
       {
-        char buffer[4096];
+        char buffer[Evaluator::ReadBufferSize];
         bool foundAny = false;
         while (fgets(buffer, sizeof(buffer), pg.get()))
         {
           foundAny = true;
           std::string_view line(buffer);
-          if (line.find("CONFIG_XDP_SOCKETS=y") != std::string_view::npos)
-            return { Kind(), Status::Pass, Name(), "CONFIG_XDP_SOCKETS=y" };
-          if (line.find("CONFIG_XDP_SOCKETS=m") != std::string_view::npos)
-            return { Kind(), Status::Pass, Name(), "CONFIG_XDP_SOCKETS=m" };
+          if (line.find(ConfigXdpSocketsBuiltin) != std::string_view::npos)
+            return { Kind(), Status::Pass, Name(), std::string(ConfigXdpSocketsBuiltin) };
+          if (line.find(ConfigXdpSocketsModule) != std::string_view::npos)
+            return { Kind(), Status::Pass, Name(), std::string(ConfigXdpSocketsModule) };
         }
         if (foundAny)
           return { Kind(), Status::Info, Name(), "kernel config lacks AF_XDP support" };
@@ -1177,16 +1182,16 @@ namespace Evaluator
     return output.str();
   }
 
-  std::string GetNicInfo(std::string_view nic)
+  std::string GetNicInfo(std::string nic)
   {
     std::ostringstream output;
     output << "NIC: " << nic;
 
-    auto driver = ReadNicDriver(std::string(nic));
+    auto driver = ReadNicDriver(nic);
 
     // Try to get hardware description via lspci
     std::string hwDesc;
-    std::string ueventPath = std::string(kSysClassNet) + std::string(nic) + "/device/uevent";
+    std::string ueventPath = std::string(SysClassNet) + nic + "/device/uevent";
     if (auto uevent = Slurp(ueventPath))
     {
       std::string pciSlot;
@@ -1194,9 +1199,9 @@ namespace Evaluator
       std::string line;
       while (std::getline(iss, line))
       {
-        if (line.rfind("PCI_SLOT_NAME=", 0) == 0)
+        if (line.rfind(PciSlotNamePrefix, 0) == 0)
         {
-          pciSlot = line.substr(14);
+          pciSlot = line.substr(PciSlotNamePrefix.size());
           break;
         }
       }
@@ -1349,7 +1354,7 @@ namespace Evaluator
     std::cout << GetCpuInfo() << "\n";
     std::cout << GetKernelInfo() << "\n";
     if (!nicName.empty())
-      std::cout << GetNicInfo(nicName) << "\n";
+      std::cout << GetNicInfo(std::string(nicName)) << "\n";
 
     PrintSectionHeader("System Checks");
 
