@@ -1180,12 +1180,18 @@ namespace Evaluator
       struct utsname unameInfo = {};
       std::string versionStr = "unknown";
       bool versionOk = false;
-      if (uname(&unameInfo) == 0)
+      if (uname(&unameInfo) != 0)
       {
-        versionStr = unameInfo.release;
-        if (auto kv = ParseKernelVersion(versionStr))
-          versionOk = KernelAtLeast(*kv, 6, 17);
+        return { Kind(), Status::Unknown, Name(),
+          "Expected kernel >= 6.17, but uname() failed: " + std::string(strerror(errno)) };
       }
+
+      versionStr = unameInfo.release;
+      if (auto kv = ParseKernelVersion(versionStr))
+        versionOk = KernelAtLeast(*kv, 6, 17);
+      else
+        return { Kind(), Status::Unknown, Name(),
+          "Cannot parse kernel version from uname: " + versionStr };
 
       // No point calling prctl on a kernel that predates the feature.
       if (!versionOk)
@@ -1199,7 +1205,7 @@ namespace Evaluator
       // but the kernel hasn't created the default 16 slots yet (on the first thread creation).
       // https://man7.org/linux/man-pages/man2/PR_FUTEX_HASH.2const.html
       if (ret >= 0)
-        return { Kind(), Status::Pass, Name(), "prctl(PR_FUTEX_HASH) succeeded;" };
+        return { Kind(), Status::Pass, Name(), "prctl(PR_FUTEX_HASH) succeeded" };
 
       static constexpr size_t BufferSize = 256;
       char buffer[BufferSize]{};
