@@ -1177,24 +1177,21 @@ namespace Evaluator
     {
       // Parse the running kernel version for diagnostics and gating.
       struct utsname unameInfo = {};
-      std::string versionStr = "unknown";
-      bool versionOk = false;
       if (uname(&unameInfo) != 0)
       {
         return { Kind(), Status::Unknown, Name(),
           "Expected kernel >= 6.17, but uname() failed: " + std::string(strerror(errno)) };
       }
 
-      versionStr = unameInfo.release;
+      std::string versionStr = unameInfo.release;
       static constexpr KernelVersion MinimumVersion{ 6, 17, 0 };
-      if (auto version = ParseKernelVersion(versionStr))
-        versionOk = *version >= MinimumVersion;
-      else
+      auto version = ParseKernelVersion(versionStr);
+      if (!version)
         return { Kind(), Status::Unknown, Name(),
           "Cannot parse kernel version from uname: " + versionStr };
 
       // No point calling prctl on a kernel that predates the feature.
-      if (!versionOk)
+      if (*version < MinimumVersion)
         return { Kind(), Status::Fail, Name(),
           "kernel " + versionStr + " < 6.17; private futex hash requires >= 6.17" };
 
@@ -1209,9 +1206,10 @@ namespace Evaluator
 
       static constexpr size_t BufferSize = 256;
       char buffer[BufferSize]{};
+      const auto errorCode = errno;
       std::snprintf(buffer, BufferSize,
         "kernel %s >= 6.17 but prctl(PR_FUTEX_HASH) failed (errno %d: %s)",
-        versionStr.c_str(), errno, strerror(errno));
+        versionStr.c_str(), errorCode, strerror(errorCode));
       return { Kind(), Status::Fail, Name(), std::string(buffer) };
     }
   };
