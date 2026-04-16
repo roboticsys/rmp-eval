@@ -47,6 +47,15 @@ namespace Evaluator
     TimerMigration,
     AfXdpSupport,
     FutexPrivateHash,
+    CpuFreqDriver,
+    IntelPStateMode,
+    HwpDynamicBoost,
+    EnergyPerfPreference,
+    HwpRequest,
+    RaceToHaltDisabled,
+    ModuleSiblingsIsolated,
+    HybridCoreType,
+    BaseFrequencyInfo,
   };
   
   enum class Status
