@@ -46,6 +46,7 @@ namespace Evaluator
     SmtSiblingIsolated,
     TimerMigration,
     AfXdpSupport,
+    FutexPrivateHash,
   };
   
   enum class Status

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
+#include <charconv>
 #include <climits>
 #include <cmath>
 #include <cstdarg>
@@ -27,8 +28,20 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+
+// PR_FUTEX_HASH was added in Linux 6.17. Define if not yet in system headers.
+#ifndef PR_FUTEX_HASH
+#define PR_FUTEX_HASH          78
+#endif
+#ifndef PR_FUTEX_HASH_SET_SLOTS
+#define PR_FUTEX_HASH_SET_SLOTS  1
+#endif
+#ifndef PR_FUTEX_HASH_GET_SLOTS
+#define PR_FUTEX_HASH_GET_SLOTS  2
+#endif
 #include <unistd.h>
 #include <vector>
 
@@ -43,6 +56,37 @@ namespace
   // Both indicate AF_XDP support is available on this kernel.
   constexpr std::string_view ConfigXdpSocketsBuiltin = "CONFIG_XDP_SOCKETS=y";
   constexpr std::string_view ConfigXdpSocketsModule  = "CONFIG_XDP_SOCKETS=m";
+  struct KernelVersion
+  {
+    int major{};
+    int minor{};
+    int patch{};
+
+    auto operator<=>(const KernelVersion& other) const = default;
+  };
+
+  // Parse a kernel version string (e.g. "6.17.1-rt5") using std::from_chars.
+  // Only the leading "major.minor.patch" numeric portion is required;
+  // trailing suffixes like "-rt5" or "-generic" are ignored.
+  [[nodiscard]] std::optional<KernelVersion> ParseKernelVersion(std::string_view release)
+  {
+    KernelVersion version{};
+    const char* ptr   = release.data();
+    const char* end = ptr + release.size();
+
+    auto result = std::from_chars(ptr, end, version.major);
+    if (result.ec != std::errc{} || result.ptr == end || *result.ptr != '.') return std::nullopt;
+
+    result = std::from_chars(result.ptr + 1, end, version.minor);
+    if (result.ec != std::errc{}) return std::nullopt;
+
+    // Patch level is optional, still return if it's missing or fails to parse.
+    if (result.ptr < end && *result.ptr == '.')
+    {
+      result = std::from_chars(result.ptr + 1, end, version.patch);
+    }
+    return version;
+  }
 
   struct PipeGuard
   {
@@ -1122,6 +1166,54 @@ namespace Evaluator
     }
   };
 
+  class FutexPrivateHashCheck final : public ICheck
+  {
+  public:
+    [[nodiscard]] CheckKind Kind() const noexcept override { return CheckKind::FutexPrivateHash; }
+    [[nodiscard]] const std::string& Name() const noexcept override { static const std::string k = "Private futex hash table"; return k; }
+    [[nodiscard]] Domain GetDomain() const noexcept override { return Domain::System; }
+
+    [[nodiscard]] CheckResult Evaluate(const CheckContext&, const IDataSource&) const override
+    {
+      // Parse the running kernel version for diagnostics and gating.
+      struct utsname unameInfo = {};
+      if (uname(&unameInfo) != 0)
+      {
+        return { Kind(), Status::Unknown, Name(),
+          "Expected kernel >= 6.17, but uname() failed: " + std::string(strerror(errno)) };
+      }
+
+      std::string versionStr = unameInfo.release;
+      static constexpr KernelVersion MinimumVersion{ 6, 17, 0 };
+      auto version = ParseKernelVersion(versionStr);
+      if (!version)
+        return { Kind(), Status::Unknown, Name(),
+          "Cannot parse kernel version from uname: " + versionStr };
+
+      // No point calling prctl on a kernel that predates the feature.
+      if (*version < MinimumVersion)
+        return { Kind(), Status::Fail, Name(),
+          "kernel " + versionStr + " < 6.17; private futex hash requires >= 6.17" };
+
+      // Probe the running kernel — this is the authoritative test.
+      // PR_FUTEX_HASH_GET_SLOTS is a read-only query with no side effects.
+      int ret = prctl(PR_FUTEX_HASH, PR_FUTEX_HASH_GET_SLOTS, 0, 0, 0);
+      // The return value may be 0, indicating the PR_FUTEX_HASH operation is valid
+      // but the kernel hasn't created the default 16 slots yet (on the first thread creation).
+      // https://man7.org/linux/man-pages/man2/PR_FUTEX_HASH.2const.html
+      if (ret >= 0)
+        return { Kind(), Status::Pass, Name(), "prctl(PR_FUTEX_HASH) succeeded" };
+
+      static constexpr size_t BufferSize = 256;
+      char buffer[BufferSize]{};
+      const auto errorCode = errno;
+      std::snprintf(buffer, BufferSize,
+        "kernel %s >= 6.17 but prctl(PR_FUTEX_HASH) failed (errno %d: %s)",
+        versionStr.c_str(), errorCode, strerror(errorCode));
+      return { Kind(), Status::Fail, Name(), std::string(buffer) };
+    }
+  };
+
   // Helper functions for system info
 
   std::string GetCpuInfo()
@@ -1377,6 +1469,7 @@ namespace Evaluator
     system_checks.emplace_back(std::make_unique<Evaluator::RtThrottlingCheck>());
     system_checks.emplace_back(std::make_unique<Evaluator::ClocksourceCheck>());
     system_checks.emplace_back(std::make_unique<Evaluator::AfXdpSupportCheck>());
+    system_checks.emplace_back(std::make_unique<Evaluator::FutexPrivateHashCheck>());
 
     for (const auto &check : system_checks)
     {
