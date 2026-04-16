@@ -61,6 +61,8 @@ namespace
     int major{};
     int minor{};
     int patch{};
+
+    auto operator<=>(const KernelVersion& other) const = default;
   };
 
   // Parse a kernel version string (e.g. "6.17.1-rt5") using std::from_chars.
@@ -84,11 +86,6 @@ namespace
       result = std::from_chars(result.ptr + 1, end, version.patch);
     }
     return version;
-  }
-
-  [[nodiscard]] bool KernelAtLeast(const KernelVersion& version, int major, int minor)
-  {
-    return version.major > major || (version.major == major && version.minor >= minor);
   }
 
   struct PipeGuard
@@ -1189,8 +1186,9 @@ namespace Evaluator
       }
 
       versionStr = unameInfo.release;
-      if (auto kv = ParseKernelVersion(versionStr))
-        versionOk = KernelAtLeast(*kv, 6, 17);
+      static constexpr KernelVersion MinimumVersion{ 6, 17, 0 };
+      if (auto version = ParseKernelVersion(versionStr))
+        versionOk = *version >= MinimumVersion;
       else
         return { Kind(), Status::Unknown, Name(),
           "Cannot parse kernel version from uname: " + versionStr };
