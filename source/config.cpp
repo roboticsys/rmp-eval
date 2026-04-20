@@ -364,6 +364,7 @@ namespace
   [[nodiscard]] CoreType ReadCpuidHybrid(int cpu)
   {
 #if defined(__x86_64__) || defined(__i386__)
+    if (cpu < 0 || cpu >= CPU_SETSIZE) return CoreType::Unknown;
     cpu_set_t saved;
     CPU_ZERO(&saved);
     if (sched_getaffinity(0, sizeof(saved), &saved) != 0) return CoreType::Unknown;
@@ -1547,8 +1548,8 @@ namespace Evaluator
       // MSR_POWER_CTL bit 19 = DISABLE_RACE_TO_HLT
       const bool disabled = (*value & (1ULL << 19)) != 0;
       char detail[64];
-      std::snprintf(detail, sizeof(detail), "MSR 0x1FC bit 19 %s (raw 0x%016lx)",
-        disabled ? "set" : "clear", static_cast<unsigned long>(*value));
+      std::snprintf(detail, sizeof(detail), "MSR 0x1FC bit 19 %s (raw 0x%016llx)",
+        disabled ? "set" : "clear", static_cast<unsigned long long>(*value));
       if (disabled) return { Kind(), Status::Pass, Name(), detail };
       return { Kind(), Status::Fail, Name(),
         std::string(detail) + "; disable in BIOS or write MSR 0x1FC bit 19" };
