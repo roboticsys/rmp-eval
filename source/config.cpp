@@ -10,9 +10,11 @@
 #include <climits>
 #include <cmath>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -24,6 +26,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <optional>
+#include <sched.h>
 #include <set>
 #include <sstream>
 #include <string>
@@ -31,6 +34,9 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#if defined(__x86_64__) || defined(__i386__)
+#  include <cpuid.h>
+#endif
 
 // PR_FUTEX_HASH was added in Linux 6.17. Define if not yet in system headers.
 #ifndef PR_FUTEX_HASH
@@ -270,6 +276,202 @@ namespace
     struct utsname uts = {};
     if (uname(&uts) == 0) return std::string(uts.machine);
     return std::string("Unknown CPU");
+  }
+
+  // CPU vendor / generation detection (used to gate Intel-12th-gen+ checks)
+
+  enum class CpuVendor { Intel, Amd, Arm, Unknown };
+
+  [[nodiscard]] CpuVendor DetectCpuVendor()
+  {
+    static const CpuVendor cached = []() -> CpuVendor {
+      if (auto cpuinfo = Slurp("/proc/cpuinfo"))
+      {
+        std::istringstream iss(*cpuinfo);
+        std::string line;
+        while (std::getline(iss, line))
+        {
+          if (line.rfind("vendor_id", 0) == 0)
+          {
+            auto pos = line.find(':');
+            if (pos == std::string::npos) continue;
+            auto value = Trim(line.substr(pos + 1));
+            if (value == "GenuineIntel") return CpuVendor::Intel;
+            if (value == "AuthenticAMD") return CpuVendor::Amd;
+            return CpuVendor::Unknown;
+          }
+        }
+      }
+      struct utsname uts = {};
+      if (uname(&uts) == 0)
+      {
+        std::string machine = uts.machine;
+        if (machine.rfind("aarch64", 0) == 0 || machine.rfind("arm", 0) == 0)
+          return CpuVendor::Arm;
+      }
+      return CpuVendor::Unknown;
+    }();
+    return cached;
+  }
+
+  enum class IntelGen { PreAlderLake, AlderLakePlus, Unknown };
+
+  [[nodiscard]] IntelGen DetectIntelGen()
+  {
+    static const IntelGen cached = []() -> IntelGen {
+      if (DetectCpuVendor() != CpuVendor::Intel) return IntelGen::Unknown;
+      auto cpuinfo = Slurp("/proc/cpuinfo");
+      if (!cpuinfo) return IntelGen::Unknown;
+      std::istringstream iss(*cpuinfo);
+      std::string line;
+      int family = -1;
+      int model = -1;
+      while (std::getline(iss, line))
+      {
+        auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        auto key = Trim(line.substr(0, colon));
+        auto val = Trim(line.substr(colon + 1));
+        try
+        {
+          if (key == "cpu family" && family < 0) family = std::stoi(val);
+          else if (key == "model" && model < 0) model = std::stoi(val);
+        }
+        catch (...) {}
+        if (family >= 0 && model >= 0) break;
+      }
+      if (family != 6 || model < 0) return IntelGen::Unknown;
+      // arch/x86/include/asm/intel-family.h Alder Lake / Raptor Lake / Meteor
+      // Lake / Alder Lake-N / Amston Lake (Gracemont).
+      switch (model)
+      {
+        case 0x97: case 0x9A:                         // Alder Lake
+        case 0xB7: case 0xBA: case 0xBF:              // Raptor Lake
+        case 0xAA: case 0xAC:                         // Meteor Lake
+        case 0xBE:                                    // Alder Lake-N / Amston Lake
+          return IntelGen::AlderLakePlus;
+        default:
+          return IntelGen::PreAlderLake;
+      }
+    }();
+    return cached;
+  }
+
+  // CPUID leaf 0x1A core type (EAX[31:24]):
+  //   0x20 = Atom (E-core)   0x40 = Core (P-core)
+  enum class CoreType { Performance, Efficiency, Unknown };
+
+  [[nodiscard]] CoreType ReadCpuidHybrid(int cpu)
+  {
+#if defined(__x86_64__) || defined(__i386__)
+    if (cpu < 0 || cpu >= CPU_SETSIZE) return CoreType::Unknown;
+    cpu_set_t saved;
+    CPU_ZERO(&saved);
+    if (sched_getaffinity(0, sizeof(saved), &saved) != 0) return CoreType::Unknown;
+    cpu_set_t target;
+    CPU_ZERO(&target);
+    CPU_SET(cpu, &target);
+    if (sched_setaffinity(0, sizeof(target), &target) != 0) return CoreType::Unknown;
+
+    unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
+    int ok = __get_cpuid_count(0x1A, 0, &eax, &ebx, &ecx, &edx);
+    sched_setaffinity(0, sizeof(saved), &saved);
+    if (!ok || eax == 0) return CoreType::Unknown;
+
+    unsigned native_type = (eax >> 24) & 0xff;
+    if (native_type == 0x40) return CoreType::Performance;
+    if (native_type == 0x20) return CoreType::Efficiency;
+    return CoreType::Unknown;
+#else
+    (void)cpu;
+    return CoreType::Unknown;
+#endif
+  }
+
+  // Walks /sys/devices/system/cpu/cpuX/cache/index*; returns the CPU set from
+  // the highest-level Unified entry whose shared_cpu_list is a strict subset
+  // of the package CPU list (i.e. the L2-shared module on Alder Lake-N's
+  // 4-core Gracemont cluster). Empty optional means no module-level grouping
+  // could be identified.
+  [[nodiscard]] std::optional<std::set<int>> ModuleSiblings(int cpu, const Evaluator::IDataSource& dataSource)
+  {
+    std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu);
+    auto package_value = dataSource.Read(base + "/topology/package_cpus_list");
+    if (!package_value) package_value = dataSource.Read(base + "/topology/core_siblings_list");
+    if (!package_value) return std::nullopt;
+    auto package_set = ParseCpuList(*package_value);
+    if (package_set.size() <= 1) return std::nullopt;
+
+    std::error_code error_code;
+    std::optional<std::set<int>> best;
+    int best_level = -1;
+    for (auto &entry : fs::directory_iterator(fs::path(base) / "cache", error_code))
+    {
+      if (!entry.is_directory()) continue;
+      auto name = entry.path().filename().string();
+      if (name.rfind("index", 0) != 0) continue;
+      auto level_value = dataSource.Read((entry.path() / "level").string());
+      auto type_value = dataSource.Read((entry.path() / "type").string());
+      auto list_value = dataSource.Read((entry.path() / "shared_cpu_list").string());
+      if (!level_value || !type_value || !list_value) continue;
+      if (Trim(*type_value) != "Unified") continue;
+      int level = 0;
+      try { level = std::stoi(Trim(*level_value)); } catch (...) { continue; }
+      auto siblings = ParseCpuList(*list_value);
+      if (siblings.size() <= 1) continue;
+      // Strict subset of the package: this is a per-module cache.
+      bool strict_subset = siblings.size() < package_set.size() &&
+        std::all_of(siblings.begin(), siblings.end(),
+                    [&](int c){ return package_set.count(c) != 0; });
+      if (!strict_subset) continue;
+      if (level > best_level)
+      {
+        best_level = level;
+        best = std::move(siblings);
+      }
+    }
+    return best;
+  }
+
+  // Native MSR reader. /dev/cpu/N/msr is provided by the `msr` kernel module
+  // and requires CAP_SYS_RAWIO (rmp-eval already requires root). We cache the
+  // outcome of the first probe so repeated checks don't reopen.
+  struct MsrFd
+  {
+    int fd{-1};
+    explicit MsrFd(int f) : fd(f) {}
+    ~MsrFd() { if (fd >= 0) ::close(fd); }
+    MsrFd(const MsrFd&) = delete;
+    MsrFd& operator=(const MsrFd&) = delete;
+    explicit operator bool() const { return fd >= 0; }
+  };
+
+  enum class MsrAvailability { Unknown, Available, ModuleMissing, AccessDenied };
+
+  inline MsrAvailability& MsrAvailabilityCache()
+  {
+    static MsrAvailability state = MsrAvailability::Unknown;
+    return state;
+  }
+
+  [[nodiscard]] std::optional<uint64_t> ReadMsr(int cpu, uint32_t addr)
+  {
+    auto& cache = MsrAvailabilityCache();
+    if (cache == MsrAvailability::ModuleMissing || cache == MsrAvailability::AccessDenied)
+      return std::nullopt;
+    std::string path = "/dev/cpu/" + std::to_string(cpu) + "/msr";
+    MsrFd guard{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
+    if (!guard)
+    {
+      if (errno == ENOENT) cache = MsrAvailability::ModuleMissing;
+      else if (errno == EACCES || errno == EPERM) cache = MsrAvailability::AccessDenied;
+      return std::nullopt;
+    }
+    uint64_t value = 0;
+    ssize_t got = ::pread(guard.fd, &value, sizeof(value), static_cast<off_t>(addr));
+    if (got != static_cast<ssize_t>(sizeof(value))) return std::nullopt;
+    cache = MsrAvailability::Available;
+    return value;
   }
 
   bool NicExists(const Evaluator::IDataSource& dataSource, const std::string& nic)
@@ -555,6 +757,18 @@ namespace Evaluator
       auto current_freq = read_int64(dataSource, base + "scaling_cur_freq");
       auto min_freq = read_int64(dataSource, base + "scaling_min_freq");
       auto max_freq = read_int64(dataSource, base + "scaling_max_freq");
+      auto base_freq = read_int64(dataSource, base + "base_frequency");
+      auto pstate_status_value = dataSource.Read("/sys/devices/system/cpu/intel_pstate/status");
+      auto hwp_boost_value = dataSource.Read("/sys/devices/system/cpu/intel_pstate/hwp_dynamic_boost");
+      auto epp_value = dataSource.Read(base + "energy_performance_preference");
+      const bool hwp_active = pstate_status_value && Trim(*pstate_status_value) == "active";
+      const bool hwp_boost_on = hwp_active && hwp_boost_value && Trim(*hwp_boost_value) == "1";
+      const bool epp_non_perf = hwp_active && epp_value && Trim(*epp_value) != "performance";
+      auto annotate = [&](std::string detail) -> std::string {
+        if (base_freq) detail += ", base=" + std::to_string(*base_freq) + " kHz";
+        if (epp_non_perf) detail += " [EPP=" + Trim(*epp_value) + "]";
+        return detail;
+      };
       if (current_freq && min_freq && max_freq)
       {
         // Check if frequency is locked (min == max == current, with small tolerance for current)
@@ -564,12 +778,16 @@ namespace Evaluator
           bool current_matches = std::abs(*current_freq - *max_freq) <= tolerance;
           if (current_matches)
           {
-            return { Kind(), Status::Pass, Name(), std::to_string(*max_freq) + " kHz (locked)" };
+            std::string detail = std::to_string(*max_freq) + " kHz (locked)";
+            if (hwp_boost_on)
+              return { Kind(), Status::Info, Name(),
+                annotate(detail + " but hwp_dynamic_boost=1 may widen the real range") };
+            return { Kind(), Status::Pass, Name(), annotate(detail) };
           }
           else
           {
             std::string detail = "cur=" + std::to_string(*current_freq) + " kHz, locked=" + std::to_string(*max_freq) + " kHz";
-            return { Kind(), Status::Fail, Name(), detail };
+            return { Kind(), Status::Fail, Name(), annotate(detail) };
           }
         }
         else
@@ -577,7 +795,7 @@ namespace Evaluator
           std::string detail = "cur=" + std::to_string(*current_freq) + " kHz" +
                                ", min=" + std::to_string(*min_freq) + " kHz" +
                                ", max=" + std::to_string(*max_freq) + " kHz";
-          return { Kind(), Status::Fail, Name(), detail };
+          return { Kind(), Status::Fail, Name(), annotate(detail) };
         }
       }
       else if (current_freq || min_freq || max_freq)
@@ -1023,11 +1241,38 @@ namespace Evaluator
   {
   public:
     [[nodiscard]] CheckKind Kind() const noexcept override { return CheckKind::TurboBoostPolicy; }
-    [[nodiscard]] const std::string& Name() const noexcept override { static const std::string k = "Turbo/boost disabled"; return k; }
+    [[nodiscard]] const std::string& Name() const noexcept override
+    {
+      // Name reflects the Alder-Lake+ semantic flip when applicable.
+      static const std::string legacy = "Turbo/boost disabled";
+      static const std::string modern = "Turbo policy (Alder Lake+)";
+      return (DetectIntelGen() == IntelGen::AlderLakePlus) ? modern : legacy;
+    }
     [[nodiscard]] Domain GetDomain() const noexcept override { return Domain::Cpu; }
 
     [[nodiscard]] CheckResult Evaluate(const CheckContext&, const IDataSource& dataSource) const override
     {
+      const auto vendor = DetectCpuVendor();
+      if (vendor == CpuVendor::Arm)
+        return { Kind(), Status::Info, Name(), "n/a on ARM" };
+
+      const auto gen = DetectIntelGen();
+      if (vendor == CpuVendor::Intel && gen == IntelGen::AlderLakePlus)
+      {
+        if (auto intel_turbo = dataSource.Read("/sys/devices/system/cpu/intel_pstate/no_turbo"))
+        {
+          auto value = Trim(*intel_turbo);
+          if (value == "0")
+            return { Kind(), Status::Pass, Name(),
+              "turbo enabled (recommended on Alder Lake+; pin RT freq via HWP MSR 0x774)" };
+          if (value == "1")
+            return { Kind(), Status::Info, Name(),
+              "turbo disabled \xe2\x80\x94 legacy strategy; Intel recommends HWP pinning on this generation" };
+        }
+        return { Kind(), Status::Unknown, Name(), "intel_pstate/no_turbo not exposed" };
+      }
+
+      // Pre-Alder-Lake Intel and AMD: keep the legacy "turbo off = good" rule.
       if (auto boost_value = dataSource.Read("/sys/devices/system/cpu/cpufreq/boost"))
       {
         auto value = Trim(*boost_value);
@@ -1214,6 +1459,335 @@ namespace Evaluator
     }
   };
 
+  // Intel 12th-gen+ (Alder Lake / Raptor Lake / Meteor Lake / Alder Lake-N /
+  // Amston Lake) checks. Conditionally registered in ReportSystemConfiguration
+  // only when DetectCpuVendor()==Intel && DetectIntelGen()==AlderLakePlus, so
+  // these classes assume that gating and do not re-check vendor/generation.
+
+  class CpuFreqDriverCheck final : public ICheck
+  {
+  public:
+    [[nodiscard]] CheckKind Kind() const noexcept override { return CheckKind::CpuFreqDriver; }
+    [[nodiscard]] const std::string& Name() const noexcept override { static const std::string k = "cpufreq driver"; return k; }
+    [[nodiscard]] Domain GetDomain() const noexcept override { return Domain::System; }
+
+    [[nodiscard]] CheckResult Evaluate(const CheckContext&, const IDataSource& dataSource) const override
+    {
+      auto driver = dataSource.Read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver");
+      if (!driver) return { Kind(), Status::Info, Name(), "scaling_driver not exposed" };
+      auto value = Trim(*driver);
+      auto status = dataSource.Read("/sys/devices/system/cpu/intel_pstate/status");
+      if (status)
+      {
+        auto mode = Trim(*status);
+        return { Kind(), Status::Info, Name(), value + " (" + mode + ")" };
+      }
+      return { Kind(), Status::Info, Name(), value };
+    }
+  };
+
+  class IntelPStateModeCheck final : public ICheck
+  {
+  public:
+    [[nodiscard]] CheckKind Kind() const noexcept override { return CheckKind::IntelPStateMode; }
+    [[nodiscard]] const std::string& Name() const noexcept override { static const std::string k = "intel_pstate / HWP active"; return k; }
+    [[nodiscard]] Domain GetDomain() const noexcept override { return Domain::System; }
+
+    [[nodiscard]] CheckResult Evaluate(const CheckContext&, const IDataSource& dataSource) const override
+    {
+      auto status = dataSource.Read("/sys/devices/system/cpu/intel_pstate/status");
+      if (!status) return { Kind(), Status::Info, Name(), "intel_pstate/status not exposed" };
+      auto value = Trim(*status);
+      if (value == "active") return { Kind(), Status::Pass, Name(), "active (HWP)" };
+      if (value == "passive")
+        return { Kind(), Status::Info, Name(), "passive (loses hard max-perf limits)" };
+      if (value == "off")
+        return { Kind(), Status::Fail, Name(), "off; HWP disabled, cannot pin RT freq via MSR 0x774" };
+      return { Kind(), Status::Info, Name(), value };
+    }
+  };
+
+  class HwpDynamicBoostCheck final : public ICheck
+  {
+  public:
+    [[nodiscard]] CheckKind Kind() const noexcept override { return CheckKind::HwpDynamicBoost; }
+    [[nodiscard]] const std::string& Name() const noexcept override { static const std::string k = "HWP dynamic boost off"; return k; }
+    [[nodiscard]] Domain GetDomain() const noexcept override { return Domain::System; }
+
+    [[nodiscard]] CheckResult Evaluate(const CheckContext&, const IDataSource& dataSource) const override
+    {
+      auto value = dataSource.Read("/sys/devices/system/cpu/intel_pstate/hwp_dynamic_boost");
+      if (!value) return { Kind(), Status::Info, Name(), "not exposed (pre-HWP or passive mode)" };
+      auto v = Trim(*value);
+      if (v == "0") return { Kind(), Status::Pass, Name(), "disabled (deterministic)" };
+      if (v == "1")
+        return { Kind(), Status::Fail, Name(),
+          "enabled; reactive frequency changes cause RT jitter" };
+      return { Kind(), Status::Info, Name(), "hwp_dynamic_boost=" + v };
+    }
+  };
+
+  class RaceToHaltDisabledCheck final : public ICheck
+  {
+  public:
+    [[nodiscard]] CheckKind Kind() const noexcept override { return CheckKind::RaceToHaltDisabled; }
+    [[nodiscard]] const std::string& Name() const noexcept override { static const std::string k = "Race-to-Halt disabled"; return k; }
+    [[nodiscard]] Domain GetDomain() const noexcept override { return Domain::System; }
+
+    [[nodiscard]] CheckResult Evaluate(const CheckContext&, const IDataSource&) const override
+    {
+      auto value = ReadMsr(0, 0x1FC);
+      if (!value)
+      {
+        if (MsrAvailabilityCache() == MsrAvailability::ModuleMissing)
+          return { Kind(), Status::Info, Name(), "msr kernel module not loaded; run `modprobe msr`" };
+        if (MsrAvailabilityCache() == MsrAvailability::AccessDenied)
+          return { Kind(), Status::Info, Name(), "MSR read denied (CAP_SYS_RAWIO / msr_safe?)" };
+        return { Kind(), Status::Info, Name(), "MSR 0x1FC unreadable" };
+      }
+      // MSR_POWER_CTL bit 19 = DISABLE_RACE_TO_HLT
+      const bool disabled = (*value & (1ULL << 19)) != 0;
+      char detail[64];
+      std::snprintf(detail, sizeof(detail), "MSR 0x1FC bit 19 %s (raw 0x%016llx)",
+        disabled ? "set" : "clear", static_cast<unsigned long long>(*value));
+      if (disabled) return { Kind(), Status::Pass, Name(), detail };
+      return { Kind(), Status::Fail, Name(),
+        std::string(detail) + "; disable in BIOS or write MSR 0x1FC bit 19" };
+    }
+  };
+
+  // Determines core type for a single CPU, in priority order:
+  //   1. /sys/.../cpuX/topology/core_type   (vendor-kernel patch)
+  //   2. /sys/kernel/debug/topo/cpus/<N>/cpu_type  (debugfs, ABI-unstable)
+  //   3. CPUID leaf 0x1A executed pinned to that CPU
+  static CoreType DetectCoreTypeForCpu(int cpu, const Evaluator::IDataSource& dataSource)
+  {
+    auto base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu);
+    if (auto value = dataSource.Read(base + "/topology/core_type"))
+    {
+      std::string s = Trim(*value);
+      for (auto &ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      if (s.find("perf") != std::string::npos || s == "core") return CoreType::Performance;
+      if (s.find("eff") != std::string::npos || s == "atom") return CoreType::Efficiency;
+    }
+    if (auto value = dataSource.Read("/sys/kernel/debug/topo/cpus/" + std::to_string(cpu) + "/cpu_type"))
+    {
+      std::string s = Trim(*value);
+      for (auto &ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      if (s.find("perf") != std::string::npos) return CoreType::Performance;
+      if (s.find("eff") != std::string::npos) return CoreType::Efficiency;
+    }
+    return ReadCpuidHybrid(cpu);
+  }
+
+  class HybridCoreTypeCheck final : public ICheck
+  {
+  public:
+    [[nodiscard]] CheckKind Kind() const noexcept override { return CheckKind::HybridCoreType; }
+    [[nodiscard]] const std::string& Name() const noexcept override { static const std::string k = "RT core type (P/E)"; return k; }
+    [[nodiscard]] Domain GetDomain() const noexcept override { return Domain::Cpu; }
+
+    [[nodiscard]] CheckResult Evaluate(const CheckContext& checkContext, const IDataSource& dataSource) const override
+    {
+      if (!checkContext.cpu) return { Kind(), Status::Unknown, Name(), "no CPU subject" };
+      const int cpu = *checkContext.cpu;
+      switch (DetectCoreTypeForCpu(cpu, dataSource))
+      {
+        case CoreType::Performance:
+          return { Kind(), Status::Info, Name(),
+            "RT core " + std::to_string(cpu) + " is a P-core" };
+        case CoreType::Efficiency:
+          return { Kind(), Status::Info, Name(),
+            "RT core " + std::to_string(cpu) + " is an E-core (Gracemont module); enable HWP and pin above base" };
+        case CoreType::Unknown:
+          return { Kind(), Status::Info, Name(), "uniform cores (no hybrid signal)" };
+      }
+      return { Kind(), Status::Info, Name(), "core type undetermined" };
+    }
+  };
+
+  class BaseFrequencyInfoCheck final : public ICheck
+  {
+  public:
+    [[nodiscard]] CheckKind Kind() const noexcept override { return CheckKind::BaseFrequencyInfo; }
+    [[nodiscard]] const std::string& Name() const noexcept override { static const std::string k = "Base / max-turbo frequency"; return k; }
+    [[nodiscard]] Domain GetDomain() const noexcept override { return Domain::Cpu; }
+
+    [[nodiscard]] CheckResult Evaluate(const CheckContext& checkContext, const IDataSource& dataSource) const override
+    {
+      if (!checkContext.cpu) return { Kind(), Status::Unknown, Name(), "no CPU subject" };
+      const int cpu = *checkContext.cpu;
+      auto base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cpufreq/";
+      auto base_freq = dataSource.Read(base + "base_frequency");
+      auto max_freq = dataSource.Read(base + "cpuinfo_max_freq");
+      if (!base_freq && !max_freq)
+        return { Kind(), Status::Info, Name(), "base_frequency/cpuinfo_max_freq not exposed" };
+      auto khz_to_mhz = [](const std::string& khz_str) -> std::string {
+        try { return std::to_string(std::stoll(Trim(khz_str)) / 1000); } catch (...) { return "?"; }
+      };
+      std::string detail;
+      if (base_freq) detail += "base=" + khz_to_mhz(*base_freq) + " MHz";
+      if (max_freq)
+      {
+        if (!detail.empty()) detail += ", ";
+        detail += "max-turbo=" + khz_to_mhz(*max_freq) + " MHz";
+      }
+      return { Kind(), Status::Info, Name(), detail };
+    }
+  };
+
+  class EnergyPerfPreferenceCheck final : public ICheck
+  {
+  public:
+    [[nodiscard]] CheckKind Kind() const noexcept override { return CheckKind::EnergyPerfPreference; }
+    [[nodiscard]] const std::string& Name() const noexcept override { static const std::string k = "EPP = performance"; return k; }
+    [[nodiscard]] Domain GetDomain() const noexcept override { return Domain::Cpu; }
+
+    [[nodiscard]] CheckResult Evaluate(const CheckContext& checkContext, const IDataSource& dataSource) const override
+    {
+      if (!checkContext.cpu) return { Kind(), Status::Unknown, Name(), "no CPU subject" };
+      const int cpu = *checkContext.cpu;
+      auto path = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cpufreq/energy_performance_preference";
+      auto value = dataSource.Read(path);
+      if (!value) return { Kind(), Status::Info, Name(), "EPP not exposed by driver" };
+      auto v = Trim(*value);
+      if (v == "performance") return { Kind(), Status::Pass, Name(), "epp=performance" };
+      if (v == "balance_performance" || v == "default")
+        return { Kind(), Status::Info, Name(), "epp=" + v };
+      if (v == "balance_power" || v == "power")
+        return { Kind(), Status::Fail, Name(),
+          "epp=" + v + "; RT cores should be 'performance'" };
+      return { Kind(), Status::Info, Name(), "epp=" + v };
+    }
+  };
+
+  class ModuleSiblingsIsolatedCheck final : public ICheck
+  {
+  public:
+    [[nodiscard]] CheckKind Kind() const noexcept override { return CheckKind::ModuleSiblingsIsolated; }
+    [[nodiscard]] const std::string& Name() const noexcept override { static const std::string k = "E-core module siblings isolated"; return k; }
+    [[nodiscard]] Domain GetDomain() const noexcept override { return Domain::Cpu; }
+
+    [[nodiscard]] CheckResult Evaluate(const CheckContext& checkContext, const IDataSource& dataSource) const override
+    {
+      if (!checkContext.cpu) return { Kind(), Status::Unknown, Name(), "no CPU subject" };
+      const int cpu = *checkContext.cpu;
+      if (DetectCoreTypeForCpu(cpu, dataSource) != CoreType::Efficiency)
+        return { Kind(), Status::Info, Name(), "n/a (RT core is not in an L2-shared module)" };
+      auto siblings_opt = ModuleSiblings(cpu, dataSource);
+      if (!siblings_opt || siblings_opt->empty())
+        return { Kind(), Status::Info, Name(), "no module L2 grouping detected" };
+      auto isolated_value = dataSource.Read("/sys/devices/system/cpu/isolated");
+      if (!isolated_value)
+        return { Kind(), Status::Unknown, Name(), "cannot read /sys/.../isolated" };
+      auto isolated_set = ParseCpuList(*isolated_value);
+      std::vector<int> unisolated;
+      for (int sibling : *siblings_opt)
+      {
+        if (sibling == cpu) continue;
+        if (!isolated_set.count(sibling)) unisolated.push_back(sibling);
+      }
+      if (unisolated.empty())
+      {
+        std::ostringstream output;
+        output << "module L2 siblings { ";
+        for (auto it = siblings_opt->begin(); it != siblings_opt->end(); ++it)
+        {
+          if (it != siblings_opt->begin()) output << ", ";
+          output << *it;
+        }
+        output << " } all isolated";
+        return { Kind(), Status::Pass, Name(), output.str() };
+      }
+      std::ostringstream output;
+      output << "RT E-core " << cpu << " shares module L2 with non-isolated CPUs {";
+      for (size_t i = 0; i < unisolated.size(); ++i)
+      {
+        if (i) output << ",";
+        output << unisolated[i];
+      }
+      output << "}; isolate the whole module and HWP-pin all of it";
+      return { Kind(), Status::Fail, Name(), output.str() };
+    }
+  };
+
+  class HwpRequestCheck final : public ICheck
+  {
+  public:
+    [[nodiscard]] CheckKind Kind() const noexcept override { return CheckKind::HwpRequest; }
+    [[nodiscard]] const std::string& Name() const noexcept override { static const std::string k = "HWP_REQUEST pinned (MSR 0x774)"; return k; }
+    [[nodiscard]] Domain GetDomain() const noexcept override { return Domain::Cpu; }
+
+    [[nodiscard]] CheckResult Evaluate(const CheckContext& checkContext, const IDataSource&) const override
+    {
+      if (!checkContext.cpu) return { Kind(), Status::Unknown, Name(), "no CPU subject" };
+      const int cpu = *checkContext.cpu;
+      auto pm_enable = ReadMsr(cpu, 0x770);
+      if (!pm_enable)
+      {
+        if (MsrAvailabilityCache() == MsrAvailability::ModuleMissing)
+          return { Kind(), Status::Info, Name(), "msr kernel module not loaded; run `modprobe msr`" };
+        if (MsrAvailabilityCache() == MsrAvailability::AccessDenied)
+          return { Kind(), Status::Info, Name(), "MSR read denied (CAP_SYS_RAWIO / msr_safe?)" };
+        return { Kind(), Status::Info, Name(), "MSR 0x770 unreadable" };
+      }
+      if ((*pm_enable & 1ULL) == 0)
+        return { Kind(), Status::Fail, Name(), "HWP not enabled (MSR 0x770 bit 0 = 0)" };
+      auto request = ReadMsr(cpu, 0x774);
+      auto caps    = ReadMsr(cpu, 0x771);
+      if (!request || !caps)
+        return { Kind(), Status::Info, Name(), "MSR 0x774/0x771 unreadable" };
+      const unsigned min_perf     = static_cast<unsigned>((*request >>  0) & 0xff);
+      const unsigned max_perf     = static_cast<unsigned>((*request >>  8) & 0xff);
+      const unsigned desired_perf = static_cast<unsigned>((*request >> 16) & 0xff);
+      const unsigned epp          = static_cast<unsigned>((*request >> 24) & 0xff);
+      const unsigned highest      = static_cast<unsigned>((*caps    >>  0) & 0xff);
+      const unsigned guaranteed   = static_cast<unsigned>((*caps    >>  8) & 0xff);
+      auto epp_suffix = [&]() {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "; EPP=0x%02x (should be 0)", epp);
+        return std::string(buf);
+      };
+      if (min_perf != max_perf)
+      {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+          "HWP range unlocked min=0x%02x max=0x%02x; not deterministic \xe2\x80\x94 write MSR 0x774 with min==max==desired",
+          min_perf, max_perf);
+        std::string out = buf;
+        if (epp != 0) out += epp_suffix();
+        return { Kind(), Status::Fail, Name(), out };
+      }
+      if (desired_perf != 0 && desired_perf == min_perf && desired_perf >= guaranteed)
+      {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+          "HWP pinned perf=0x%02x (guaranteed=0x%02x, highest=0x%02x)",
+          desired_perf, guaranteed, highest);
+        std::string out = buf;
+        if (epp != 0) out += epp_suffix();
+        return { Kind(), Status::Pass, Name(), out };
+      }
+      if (min_perf == guaranteed)
+      {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+          "HWP pinned at guaranteed (base) 0x%02x; raise above to use Speed Shift on Alder Lake+",
+          guaranteed);
+        std::string out = buf;
+        if (epp != 0) out += epp_suffix();
+        return { Kind(), Status::Info, Name(), out };
+      }
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+        "HWP min=max=0x%02x but desired=0x%02x; expected min==max==desired",
+        min_perf, desired_perf);
+      std::string out = buf;
+      if (epp != 0) out += epp_suffix();
+      return { Kind(), Status::Info, Name(), out };
+    }
+  };
+
   // Helper functions for system info
 
   std::string GetCpuInfo()
@@ -1255,7 +1829,21 @@ namespace Evaluator
         if (type_string.find("perf") != std::string::npos || type_string == "core") ++performance_cores;
         else if (type_string.find("eff") != std::string::npos || type_string == "atom") ++efficiency_cores;
       }
-      if (any && (performance_cores + efficiency_cores) > 0) 
+      // topology/core_type is a vendor-kernel patch (Intel ECI), not upstream.
+      // On stock 6.x kernels we fall back to CPUID leaf 0x1A per logical CPU.
+      if (!any && DetectIntelGen() == IntelGen::AlderLakePlus)
+      {
+        for (long c = 0; c < online; ++c)
+        {
+          switch (ReadCpuidHybrid(static_cast<int>(c)))
+          {
+            case CoreType::Performance: ++performance_cores; any = true; break;
+            case CoreType::Efficiency:  ++efficiency_cores;  any = true; break;
+            case CoreType::Unknown: break;
+          }
+        }
+      }
+      if (any && (performance_cores + efficiency_cores) > 0)
         output << "; P=" << performance_cores << ", E=" << efficiency_cores;
       output << ")";
     }
@@ -1471,6 +2059,17 @@ namespace Evaluator
     system_checks.emplace_back(std::make_unique<Evaluator::AfXdpSupportCheck>());
     system_checks.emplace_back(std::make_unique<Evaluator::FutexPrivateHashCheck>());
 
+    const bool intel_alder_lake_plus =
+      DetectCpuVendor() == CpuVendor::Intel &&
+      DetectIntelGen() == IntelGen::AlderLakePlus;
+    if (intel_alder_lake_plus)
+    {
+      system_checks.emplace_back(std::make_unique<Evaluator::CpuFreqDriverCheck>());
+      system_checks.emplace_back(std::make_unique<Evaluator::IntelPStateModeCheck>());
+      system_checks.emplace_back(std::make_unique<Evaluator::HwpDynamicBoostCheck>());
+      system_checks.emplace_back(std::make_unique<Evaluator::RaceToHaltDisabledCheck>());
+    }
+
     for (const auto &check : system_checks)
     {
       auto result = check->Evaluate(checkContext, data);
@@ -1490,6 +2089,14 @@ namespace Evaluator
     core_checks.emplace_back(std::make_unique<Evaluator::SmtSiblingIsolatedCheck>());
     core_checks.emplace_back(std::make_unique<Evaluator::CStatesCappedCheck>());
     core_checks.emplace_back(std::make_unique<Evaluator::TurboPolicyCheck>());
+    if (intel_alder_lake_plus)
+    {
+      core_checks.emplace_back(std::make_unique<Evaluator::HybridCoreTypeCheck>());
+      core_checks.emplace_back(std::make_unique<Evaluator::BaseFrequencyInfoCheck>());
+      core_checks.emplace_back(std::make_unique<Evaluator::EnergyPerfPreferenceCheck>());
+      core_checks.emplace_back(std::make_unique<Evaluator::ModuleSiblingsIsolatedCheck>());
+      core_checks.emplace_back(std::make_unique<Evaluator::HwpRequestCheck>());
+    }
 
     for (const auto &check : core_checks)
     {

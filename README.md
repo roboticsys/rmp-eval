@@ -204,6 +204,38 @@ Based on the RMP [PC hardware latency requirements.](https://support.roboticsys.
 
 For 1kHz (1000µs period), aim for all samples in "Great" category with max latency < 125µs. The buckets will scale proportionally for different target periods. 
 
+### Why does rmp-eval show extra HWP/EPP/MSR rows on my Alder Lake-N (or 12th-gen+) box?
+
+Starting with 12th-gen Core, Raptor Lake, Meteor Lake, and the Atom x7000 family
+(Alder Lake-N, Amston Lake), Intel **reversed** its real-time guidance. The
+pre-Alder-Lake rule was "disable Speed Shift and Turbo for determinism." On
+12th-gen+ — especially hybrid CPUs where the RT task often lands on an E-core —
+the new rule is the opposite: **enable HWP and Turbo, then pin the RT core's
+frequency via `IA32_HWP_REQUEST` (MSR 0x774)**. On a Gracemont E-core, HWP is
+the only way to run above the (often very slow) E-core base clock.
+
+When rmp-eval detects an Intel CPU in the Alder-Lake+ family (CPUID family 6,
+models `0x97 0x9A 0xB7 0xBA 0xBF 0xAA 0xAC 0xBE`), it adds these rows:
+
+- **System**: `cpufreq driver`, `intel_pstate / HWP active`,
+  `HWP dynamic boost off`, `Race-to-Halt disabled`.
+- **Core**: `RT core type (P/E)`, `Base / max-turbo frequency`,
+  `EPP = performance`, `E-core module siblings isolated`,
+  `HWP_REQUEST pinned (MSR 0x774)`.
+
+The semantics of two existing checks also flip on this generation:
+
+- `Turbo policy (Alder Lake+)` — turbo *enabled* now Passes (and turbo disabled
+  is reported as informational, not a failure).
+- `CPU current frequency` — still requires the cpufreq sysfs lock, but adds
+  the HWP `base_frequency` to the reason string and downgrades the verdict to
+  informational when `hwp_dynamic_boost=1` is masking the lock.
+
+The MSR-backed rows (`HWP_REQUEST`, `Race-to-Halt`) require the `msr` kernel
+module. If `/dev/cpu/N/msr` is not available, those rows degrade to
+informational with a hint to run `modprobe msr` rather than failing. None of
+these rows appear at all on AMD, ARM, or pre-Alder-Lake Intel systems.
+
 ### Some config checks failed - can I still use my system?
 
 The timing results table is the ultimate test. If your latencies are consistently in "Great" range (under load) despite some config warnings, your system is still suitable.
